@@ -7,6 +7,7 @@ import os
 import time
 import tkinter as tk
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import messagebox
@@ -20,11 +21,16 @@ from trainer import (
     format_duration,
     load_sentences,
     speed_cpm,
+    split_typed_chunks,
 )
+from stats import PERIODS, PERIOD_LABELS, StatsStore
 
 APP_DIR = Path(__file__).resolve().parent
 SENTENCES_FILE = APP_DIR / "sentences.txt"
 SETTINGS_FILE = APP_DIR / ".settings.json"
+STATS_FILE = APP_DIR / ".stats.json"
+
+ALL_GROUPS = "全部句子"
 
 MIN_FONT_SIZE = 32
 MAX_FONT_SIZE = 96
@@ -226,12 +232,90 @@ class ThemeToggle(tk.Frame):
             button.set_theme(theme, selected=(key == active_key))
 
 
+class SlimScrollbar(tk.Canvas):
+    """A narrow, themeable scrollbar used when the sentence overflows."""
+
+    def __init__(self, master: tk.Misc, *, command) -> None:
+        super().__init__(
+            master,
+            width=8,
+            bd=0,
+            highlightthickness=0,
+            takefocus=0,
+            cursor="hand2",
+        )
+        self._command = command
+        self._theme: Theme | None = None
+        self._first = 0.0
+        self._last = 1.0
+        self._drag_offset = 0.0
+        self.bind("<Configure>", lambda _event: self._redraw())
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+
+    def apply_theme(self, theme: Theme) -> None:
+        self._theme = theme
+        self.configure(bg=theme.surface)
+        self._redraw()
+
+    def set(self, first, last) -> None:
+        self._first = max(0.0, min(1.0, float(first)))
+        self._last = max(self._first, min(1.0, float(last)))
+        self._redraw()
+
+    def _thumb_bounds(self) -> tuple[int, int]:
+        height = max(1, self.winfo_height())
+        top = int(self._first * height)
+        bottom = int(self._last * height)
+        if bottom - top < 24:
+            bottom = min(height, top + 24)
+            top = max(0, bottom - 24)
+        return top, bottom
+
+    def _redraw(self) -> None:
+        self.delete("all")
+        if self._theme is None:
+            return
+        width = self.winfo_width()
+        height = self.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+        self.create_rectangle(
+            0, 0, width, height, fill=self._theme.surface, outline=""
+        )
+        top, bottom = self._thumb_bounds()
+        self.create_rectangle(
+            2,
+            top,
+            max(3, width - 2),
+            bottom,
+            fill=self._theme.faint,
+            outline="",
+        )
+
+    def _on_press(self, event) -> None:
+        top, bottom = self._thumb_bounds()
+        if top <= event.y <= bottom:
+            self._drag_offset = event.y - top
+        else:
+            height = max(1, self.winfo_height())
+            span = self._last - self._first
+            target = max(0.0, min(1.0, event.y / height - span / 2))
+            self._command("moveto", target)
+            self._drag_offset = span * height / 2
+
+    def _on_drag(self, event) -> None:
+        height = max(1, self.winfo_height())
+        target = (event.y - self._drag_offset) / height
+        self._command("moveto", max(0.0, min(1.0, target)))
+
+
 class PinyinTrainerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("拼音打字练习")
-        self.root.minsize(1040, 740)
-        self.root.geometry(self._centred_geometry(1240, 880))
+        self.root.minsize(1040, 760)
+        self.root.geometry(self._centred_geometry(1240, 900))
         self.root.configure(bg=THEMES["light"].bg)
 
         self.settings = self._load_settings()
@@ -250,6 +334,21 @@ class PinyinTrainerApp:
         except (TypeError, ValueError):
             loaded_font_size = DEFAULT_FONT_SIZE
         self.font_px = self._clamp_font(loaded_font_size)
+
+        raw_show_pinyin = self.settings.get("show_pinyin", False)
+        self.show_pinyin = (
+            raw_show_pinyin if isinstance(raw_show_pinyin, bool) else False
+        )
+        raw_group = self.settings.get("group", ALL_GROUPS)
+        self.group_name = (
+            raw_group if isinstance(raw_group, str) else ALL_GROUPS
+        )
+        self.group_options: list[str] = [ALL_GROUPS]
+
+        self.stats_store = StatsStore(STATS_FILE)
+        self._error_active = False
+        self._stats_window: StatsWindow | None = None
+
         self._pick_fonts()
 
         self.library: SentenceLibrary | None = None
@@ -261,7 +360,7 @@ class PinyinTrainerApp:
         self.finished_at: float | None = None
         self._tick_job: str | None = None
         self._layout_job: str | None = None
-        self._last_card_width = 0
+        self._last_canvas_width = 0
 
         self._status_text = "输入第一个字母后开始计时。"
         self._status_kind = "muted"
@@ -270,8 +369,12 @@ class PinyinTrainerApp:
         self.progress_var = tk.StringVar(value="0 / 0 字")
         self.speed_var = tk.StringVar(value="— 字/分")
         self.font_size_var = tk.StringVar(value=str(self.font_px))
+        self.group_var = tk.StringVar(value=ALL_GROUPS)
+        self.group_button_var = tk.StringVar(value=f"{ALL_GROUPS}  ▾")
+        self.hint_var = tk.BooleanVar(value=self.show_pinyin)
 
         self.char_labels: list[tk.Label] = []
+        self.pinyin_labels: list[tk.Label | None] = []
 
         self._build_ui()
         self._apply_theme()
@@ -308,7 +411,12 @@ class PinyinTrainerApp:
         return {}
 
     def _save_settings(self) -> None:
-        payload = {"theme": self.theme_key, "font_size": self.font_px}
+        payload = {
+            "theme": self.theme_key,
+            "font_size": self.font_px,
+            "show_pinyin": self.show_pinyin,
+            "group": self.group_name,
+        }
         try:
             SETTINGS_FILE.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
@@ -365,10 +473,30 @@ class PinyinTrainerApp:
         self.pinyin_font = tkfont.Font(
             self.root, family=self.mono_family, size=-self._pinyin_size
         )
+        self.hint_font = tkfont.Font(
+            self.root, family=self.mono_family, size=-self._hint_size
+        )
+        self.separator_font = tkfont.Font(
+            self.root, family=self.mono_family, size=-self._separator_size
+        )
 
     @property
     def _pinyin_size(self) -> int:
         return max(20, min(56, round(self.font_px * 0.60)))
+
+    @property
+    def _hint_size(self) -> int:
+        return max(14, min(34, round(self.font_px * 0.32)))
+
+    @property
+    def _separator_size(self) -> int:
+        return max(8, round(self._pinyin_size * 0.45))
+
+    def _input_height(self) -> int:
+        height = 3 if self._pinyin_size > 38 else 2
+        if self.sentence is not None and len(self.sentence.target) > 90:
+            height = max(height, 3)
+        return height
 
     @staticmethod
     def _clamp_font(value: int) -> int:
@@ -387,10 +515,11 @@ class PinyinTrainerApp:
         self.container.pack(fill="both", expand=True, padx=28, pady=20)
 
         self._build_header()
+        self._build_filter_bar()
         self._build_stats()
-        self._build_sentence_card()
-        self._build_input_card()
         self._build_footer()
+        self._build_input_card()
+        self._build_sentence_card()
 
     def _build_header(self) -> None:
         self.header = tk.Frame(self.container)
@@ -460,9 +589,66 @@ class PinyinTrainerApp:
         )
         self.theme_toggle.pack(side="right", padx=(0, 16))
 
+    def _build_filter_bar(self) -> None:
+        self.filter_bar = tk.Frame(self.container)
+        self.filter_bar.pack(fill="x", pady=(12, 0))
+
+        left = tk.Frame(self.filter_bar)
+        left.pack(side="left")
+        self.group_caption = tk.Label(
+            left, text="练习分组", font=self.small_font
+        )
+        self.group_caption.pack(side="left", padx=(0, 8))
+        self.group_menu = tk.Menubutton(
+            left,
+            textvariable=self.group_button_var,
+            font=self.ui_font,
+            width=14,
+            anchor="w",
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            takefocus=0,
+            indicatoron=False,
+        )
+        self.group_popup = tk.Menu(
+            self.group_menu, tearoff=False, bd=0
+        )
+        self.group_menu.configure(menu=self.group_popup)
+        self.group_menu.pack(side="left")
+
+        self.hint_check = tk.Checkbutton(
+            self.filter_bar,
+            text="显示拼音提示",
+            variable=self.hint_var,
+            command=self._on_hint_toggle,
+            font=self.small_font,
+            bd=0,
+            highlightthickness=0,
+            takefocus=0,
+            cursor="hand2",
+        )
+        self.hint_check.pack(side="right")
+
+    def _rebuild_group_menu(self) -> None:
+        if not hasattr(self, "group_menu"):
+            return
+        menu = self.group_popup
+        menu.delete(0, "end")
+        for name in self.group_options:
+            menu.add_command(
+                label=name,
+                command=lambda selected=name: self._select_group(selected),
+            )
+        self.group_var.set(self.group_name)
+        self.group_button_var.set(f"{self.group_name}  ▾")
+
     def _build_stats(self) -> None:
         self.stats_frame = tk.Frame(self.container)
-        self.stats_frame.pack(fill="x", pady=(18, 0))
+        self.stats_frame.pack(fill="x", pady=(14, 0))
 
         self.stat_cards: list[tk.Frame] = []
         self.stat_captions: list[tk.Label] = []
@@ -498,16 +684,38 @@ class PinyinTrainerApp:
     def _build_sentence_card(self) -> None:
         self.sentence_card = tk.Frame(self.container, highlightthickness=1)
         self.sentence_card.pack(fill="both", expand=True, pady=(16, 0))
-        self.sentence_card.bind("<Configure>", self._on_sentence_configure)
+        self.sentence_canvas = tk.Canvas(
+            self.sentence_card,
+            bd=0,
+            highlightthickness=0,
+            takefocus=0,
+        )
+        self.sentence_scrollbar = SlimScrollbar(
+            self.sentence_card,
+            command=self.sentence_canvas.yview,
+        )
+        self._scrollbar_visible = False
+        self.sentence_canvas.configure(
+            yscrollcommand=self.sentence_scrollbar.set
+        )
+        self.sentence_canvas.pack(fill="both", expand=True)
+        self.sentence_canvas.bind(
+            "<Configure>", self._on_sentence_canvas_configure
+        )
+        self.sentence_canvas.bind("<MouseWheel>", self._on_sentence_wheel)
 
-        self.sentence_content = tk.Frame(self.sentence_card)
-        self.sentence_content.pack(expand=True, padx=32, pady=20)
+        self.sentence_content = tk.Frame(self.sentence_canvas)
+        self.sentence_content.bind("<MouseWheel>", self._on_sentence_wheel)
+        self._sentence_window = self.sentence_canvas.create_window(
+            (0, 0), window=self.sentence_content, anchor="nw"
+        )
 
     def _build_input_card(self) -> None:
         self.input_card = tk.Frame(self.container, highlightthickness=1)
-        self.input_card.pack(fill="x", pady=(14, 0))
+        self.input_card.pack(side="bottom", fill="x", pady=(14, 0))
 
-        inner = tk.Frame(self.input_card)
+        self.input_inner = tk.Frame(self.input_card)
+        inner = self.input_inner
         inner.pack(fill="x", padx=18, pady=(12, 10))
 
         self.input_top = tk.Frame(inner)
@@ -519,12 +727,12 @@ class PinyinTrainerApp:
         self.input_title.pack(side="left")
         self.input_hint = tk.Label(
             top,
-            text="无需声调 · 空格自动忽略",
+            text="无需声调 · 无需空格 · 自动分字",
             font=self.small_font,
         )
         self.input_hint.pack(side="right")
 
-        self.input_text = tk.Text(
+        self.input_display = tk.Text(
             inner,
             height=2,
             wrap="char",
@@ -534,19 +742,37 @@ class PinyinTrainerApp:
             highlightthickness=0,
             padx=14,
             pady=10,
-            spacing1=2,
-            spacing2=2,
-            spacing3=2,
-            insertwidth=2,
-            undo=False,
+            spacing1=1,
+            spacing2=1,
+            spacing3=1,
+            takefocus=0,
+            cursor="xterm",
+            state="disabled",
         )
-        self.input_text.pack(fill="x", pady=(8, 0))
-        self.input_text.bind("<KeyRelease>", self._on_key_release)
-        self.input_text.bind("<<Paste>>", self._on_paste)
-        self.input_text.bind("<<Cut>>", self._on_paste)
-        self.input_text.bind("<Return>", self._on_return)
-        self.input_text.bind("<KP_Enter>", self._on_return)
-        self.input_text.bind("<Shift-Return>", self._on_return)
+        self.input_display.pack(fill="x", pady=(8, 0))
+        self.input_display.bind("<Button-1>", self._focus_input_entry)
+
+        # The real editable entry is kept invisible; the display above is a
+        # read-only, syllable-grouped rendering of its contents.
+        self.input_entry = tk.Entry(
+            inner,
+            width=1,
+            bd=0,
+            highlightthickness=0,
+            relief="flat",
+            insertwidth=0,
+            takefocus=0,
+            exportselection=False,
+        )
+        self.input_entry.place(x=0, y=0, width=2, height=2)
+        self.input_entry.bind("<KeyRelease>", self._on_key_release)
+        self.input_entry.bind("<<Paste>>", self._on_paste)
+        self.input_entry.bind("<<Cut>>", self._on_paste)
+        self.input_entry.bind("<Return>", self._on_return)
+        self.input_entry.bind("<KP_Enter>", self._on_return)
+        self.input_entry.bind("<Shift-Return>", self._on_return)
+        for sequence in ("<Left>", "<Right>", "<Up>", "<Down>", "<Home>", "<End>", "<Delete>"):
+            self.input_entry.bind(sequence, self._block_cursor_move)
 
         self.status_label = tk.Label(
             inner,
@@ -556,13 +782,23 @@ class PinyinTrainerApp:
         )
         self.status_label.pack(fill="x", pady=(7, 0))
 
+        for widget in (
+            self.input_card,
+            self.input_inner,
+            self.input_top,
+            self.input_title,
+            self.input_hint,
+            self.status_label,
+        ):
+            widget.bind("<Button-1>", self._focus_input_entry, add="+")
+
     def _build_footer(self) -> None:
         self.footer = tk.Frame(self.container)
-        self.footer.pack(fill="x", pady=(12, 0))
+        self.footer.pack(side="bottom", fill="x", pady=(12, 0))
 
         self.footer_hint = tk.Label(
             self.footer,
-            text="Backspace 删除   ·   Enter 下一句   ·   Ctrl+R 重开   ·   Ctrl+滚轮 调字号",
+            text="Backspace 删除   ·   Enter 下一句   ·   Ctrl+R 重开   ·   F5 重载",
             font=self.small_font,
             anchor="w",
         )
@@ -590,6 +826,17 @@ class PinyinTrainerApp:
         )
         self.reload_button.pack(side="right", padx=(0, 8))
 
+        self.stats_button = ThemedButton(
+            self.footer,
+            text="错误统计",
+            command=self._open_stats,
+            kind="soft",
+            font=self.button_font,
+            padx=12,
+            pady=5,
+        )
+        self.stats_button.pack(side="right", padx=(0, 8))
+
     # ------------------------------------------------------------------
     # Theme
     # ------------------------------------------------------------------
@@ -598,9 +845,13 @@ class PinyinTrainerApp:
         self.root.configure(bg=theme.bg)
         self.container.configure(bg=theme.bg)
 
-        for frame in (self.header, self.footer):
+        for frame in (self.header, self.filter_bar, self.footer):
             frame.configure(bg=theme.bg)
-        for child in (self.header.winfo_children() + self.footer.winfo_children()):
+        for child in (
+            self.header.winfo_children()
+            + self.filter_bar.winfo_children()
+            + self.footer.winfo_children()
+        ):
             if isinstance(child, tk.Frame):
                 child.configure(bg=theme.bg)
 
@@ -611,6 +862,32 @@ class PinyinTrainerApp:
             widget.configure(bg=theme.bg, fg=theme.muted)
         self.font_group.configure(bg=theme.bg)
         self.font_value.configure(bg=theme.bg, fg=theme.text)
+
+        self.group_caption.configure(bg=theme.bg, fg=theme.muted)
+        self.group_menu.configure(
+            bg=theme.surface_alt,
+            fg=theme.text,
+            activebackground=theme.button_hover,
+            activeforeground=theme.text,
+            highlightbackground=theme.border,
+            highlightcolor=theme.border,
+        )
+        self.group_popup.configure(
+            bg=theme.surface,
+            fg=theme.text,
+            activebackground=theme.accent,
+            activeforeground=theme.accent_fg,
+            selectcolor=theme.accent_soft,
+            font=self.ui_font,
+        )
+        self.hint_check.configure(
+            bg=theme.bg,
+            fg=theme.text,
+            activebackground=theme.bg,
+            activeforeground=theme.text,
+            selectcolor=theme.surface_alt,
+            disabledforeground=theme.faint,
+        )
 
         self.stats_frame.configure(bg=theme.bg)
         for card in self.stat_cards:
@@ -632,6 +909,8 @@ class PinyinTrainerApp:
             highlightbackground=theme.border,
             highlightcolor=theme.border,
         )
+        self.sentence_canvas.configure(bg=theme.surface)
+        self.sentence_scrollbar.apply_theme(theme)
         self.sentence_content.configure(bg=theme.surface)
 
         self.input_card.configure(bg=theme.surface)
@@ -639,14 +918,18 @@ class PinyinTrainerApp:
         self.input_hint.configure(bg=theme.surface, fg=theme.muted)
         self.input_top.configure(bg=theme.surface)
         self.status_label.configure(bg=theme.surface)
-        inner = self.input_text.master
+        inner = self.input_display.master
         inner.configure(bg=theme.surface)
-        self.input_text.configure(
+        self.input_display.configure(
             bg=theme.surface_alt,
             fg=theme.text,
-            insertbackground=theme.accent,
-            selectbackground=theme.selection,
-            selectforeground=theme.text,
+        )
+        self.input_entry.configure(
+            bg=theme.surface_alt,
+            fg=theme.surface_alt,
+            insertbackground=theme.surface_alt,
+            selectbackground=theme.surface_alt,
+            selectforeground=theme.surface_alt,
         )
 
         self.footer_hint.configure(bg=theme.bg, fg=theme.muted)
@@ -656,6 +939,7 @@ class PinyinTrainerApp:
         self.font_plus.set_theme(theme)
         self.reload_button.set_theme(theme)
         self.open_button.set_theme(theme)
+        self.stats_button.set_theme(theme)
         self.theme_toggle.apply_theme(theme, self.theme_key)
 
         self._set_status(self._status_text, self._status_kind)
@@ -682,9 +966,12 @@ class PinyinTrainerApp:
         self.font_size_var.set(str(new_size))
         self.cjk_font.configure(size=-new_size)
         self.pinyin_font.configure(size=-self._pinyin_size)
-        self.input_text.configure(
-            height=2 if self._pinyin_size <= 38 else 3
+        self.hint_font.configure(size=-self._hint_size)
+        self.separator_font.configure(size=-self._separator_size)
+        self.input_display.configure(
+            height=self._input_height()
         )
+        self._render_input_display()
         self._save_settings()
         self._schedule_layout(force=True)
         self._restore_focus()
@@ -719,11 +1006,13 @@ class PinyinTrainerApp:
             return False
 
         self.library = library
-        self.bag = SentenceBag(library.sentences)
-        self.subtitle_label.configure(
-            text=f"题库 {library.count} 句 · 一句一句，练出速度"
-        )
-        self._next_sentence()
+        self.group_options = [ALL_GROUPS, *library.groups]
+        if self.group_name not in self.group_options:
+            self.group_name = ALL_GROUPS
+        self.group_var.set(self.group_name)
+        self._rebuild_group_menu()
+        self.group_menu.configure(state="normal")
+        self._start_group()
 
         if library.skipped:
             detail = "\n".join(library.skipped[:8])
@@ -740,11 +1029,75 @@ class PinyinTrainerApp:
             )
         return True
 
+    def _filtered_sentences(self) -> list[Sentence]:
+        if self.library is None:
+            return []
+        if self.group_name == ALL_GROUPS:
+            return list(self.library.sentences)
+        return [
+            sentence
+            for sentence in self.library.sentences
+            if sentence.group == self.group_name
+        ]
+
+    def _update_subtitle(self) -> None:
+        if self.library is None:
+            return
+        count = len(self._filtered_sentences())
+        if self.group_name == ALL_GROUPS:
+            self.subtitle_label.configure(
+                text=f"题库 {self.library.count} 句 · 全部句子"
+            )
+        else:
+            self.subtitle_label.configure(
+                text=f"题库 {self.library.count} 句 · {self.group_name} {count} 句"
+            )
+
+    def _start_group(self) -> None:
+        sentences = self._filtered_sentences()
+        if not sentences:
+            self.bag = None
+            self._set_status("当前分组没有可用句子。", "error")
+            return
+        self.bag = SentenceBag(sentences)
+        self._update_subtitle()
+        self._next_sentence()
+
+    def _select_group(self, selected: str) -> None:
+        if selected not in self.group_options:
+            return
+        if selected == self.group_name and self.sentence is not None:
+            self.group_var.set(selected)
+            self.group_button_var.set(f"{selected}  ▾")
+            return
+        self.group_name = selected
+        self.group_var.set(selected)
+        self.group_button_var.set(f"{selected}  ▾")
+        self._save_settings()
+        self._start_group()
+        self._set_status(f"已切换到：{selected}", "info")
+        self._restore_focus()
+
+    def _on_hint_toggle(self) -> None:
+        self.show_pinyin = bool(self.hint_var.get())
+        self._error_active = bool(
+            self.analysis is not None and self.analysis.has_error
+        )
+        self._save_settings()
+        self._schedule_layout(force=True)
+        if self.show_pinyin:
+            self._set_status("已显示拼音提示；错字统计暂停记录。", "info")
+        else:
+            self._set_status("已关闭拼音提示；之后的错字会记录到统计。", "info")
+        self._restore_focus()
+
     def _show_library_error(self, message: str) -> None:
         self.subtitle_label.configure(text="题库加载失败")
         self._set_status("无法加载 sentences.txt，请检查文件。", "error")
-        if hasattr(self, "input_text"):
-            self.input_text.configure(state="disabled")
+        if hasattr(self, "input_entry"):
+            self.input_entry.configure(state="disabled")
+        if hasattr(self, "group_menu"):
+            self.group_menu.configure(state="disabled")
         messagebox.showerror(
             "无法加载题库",
             f"{message}\n\n请确认 sentences.txt 位于：\n{SENTENCES_FILE}",
@@ -768,6 +1121,18 @@ class PinyinTrainerApp:
             return
         self._set_status("已打开题库；保存后点击“重新加载题库”。", "info")
 
+    def _open_stats(self) -> None:
+        if self._stats_window is not None:
+            try:
+                if self._stats_window.winfo_exists():
+                    self._stats_window.lift()
+                    self._stats_window.focus_set()
+                    return
+            except tk.TclError:
+                pass
+            self._stats_window = None
+        self._stats_window = StatsWindow(self)
+
     # ------------------------------------------------------------------
     # Current attempt
     # ------------------------------------------------------------------
@@ -784,10 +1149,13 @@ class PinyinTrainerApp:
         self._cancel_tick()
         self.started_at = None
         self.finished_at = None
+        self._error_active = False
         self.analysis = analyse(self.sentence, "") if self.sentence else None
         self._set_status(status, "muted")
-        self.input_text.configure(state="normal")
-        self.input_text.delete("1.0", "end")
+        self.input_entry.configure(state="normal")
+        self.input_entry.delete(0, "end")
+        self.input_entry.icursor("end")
+        self.input_display.configure(height=self._input_height())
         self._apply_input_visuals()
         self._update_stats()
         self._schedule_layout(force=True)
@@ -810,10 +1178,21 @@ class PinyinTrainerApp:
         return "break"
 
     def _restore_focus(self) -> None:
-        if self.input_text.cget("state") == "normal":
-            self.input_text.focus_set()
+        if self.input_entry.cget("state") == "normal":
+            self.input_entry.focus_set()
+            self.input_entry.icursor("end")
         else:
             self.root.focus_set()
+
+    def _focus_input_entry(self, _event=None):
+        if self.input_entry.cget("state") == "normal":
+            self.input_entry.focus_set()
+            self.input_entry.icursor("end")
+        return "break"
+
+    @staticmethod
+    def _block_cursor_move(_event=None):
+        return "break"
 
     # ------------------------------------------------------------------
     # Typing input
@@ -827,16 +1206,42 @@ class PinyinTrainerApp:
     def _update_attempt(self) -> None:
         if self.sentence is None:
             return
-        if self.input_text.cget("state") == "disabled":
+        if self.input_entry.cget("state") == "disabled":
             return
 
-        raw = self.input_text.get("1.0", "end-1c")
+        raw = self.input_entry.get()
+        self.input_entry.icursor("end")
         result = analyse(self.sentence, raw)
         self.analysis = result
+
+        # Keep the invisible input buffer to letters only.  Users never need
+        # to type spaces, and this avoids an invisible space consuming a
+        # Backspace press.
+        if raw != result.normalized:
+            self.input_entry.delete(0, "end")
+            self.input_entry.insert(0, result.normalized)
+            self.input_entry.icursor("end")
 
         if self.started_at is None and result.normalized:
             self.started_at = time.perf_counter()
             self._schedule_tick()
+
+        if result.has_error:
+            if (
+                not self.show_pinyin
+                and not self._error_active
+                and result.current_index is not None
+            ):
+                item = self.sentence.chars[result.current_index]
+                self.stats_store.record(
+                    char=item.char,
+                    target=item.pinyin,
+                    typed=result.normalized,
+                    sentence=self.sentence.text,
+                )
+            self._error_active = True
+        else:
+            self._error_active = False
 
         self._refresh_char_states()
         self._update_stats()
@@ -847,7 +1252,7 @@ class PinyinTrainerApp:
                 self.finished_at = time.perf_counter()
                 self._cancel_tick()
                 self._update_stats()
-                self.input_text.configure(state="disabled")
+                self.input_entry.configure(state="disabled")
                 elapsed = self._elapsed()
                 self._set_status(
                     f"完成！用时 {elapsed:.1f} 秒，按 Enter 进入下一句。",
@@ -866,30 +1271,82 @@ class PinyinTrainerApp:
             self._set_status("输入第一个字母后开始计时。", "muted")
 
     def _apply_input_visuals(self) -> None:
-        if not hasattr(self, "input_text"):
+        if not hasattr(self, "input_display"):
             return
         theme = self.theme
         result = self.analysis
         if result is not None and result.is_complete:
             border = theme.done
-            foreground = theme.done
         elif result is not None and result.has_error:
             border = theme.error
-            foreground = theme.error
         else:
             border = theme.border
-            foreground = theme.text
 
         self.input_card.configure(
             highlightbackground=border, highlightcolor=border
         )
-        self.input_text.configure(fg=foreground)
+        self._render_input_display()
+
+    def _render_input_display(self) -> None:
+        if not hasattr(self, "input_display"):
+            return
+
+        theme = self.theme
+        display = self.input_display
+        result = self.analysis
         if result is not None and result.is_complete:
-            self.input_text.configure(bg=theme.done_soft)
+            background = theme.done_soft
         elif result is not None and result.has_error:
-            self.input_text.configure(bg=theme.error_soft)
+            background = theme.error_soft
         else:
-            self.input_text.configure(bg=theme.surface_alt)
+            background = theme.surface_alt
+
+        display.configure(state="normal", bg=background, fg=theme.text)
+        display.delete("1.0", "end")
+        display.tag_configure("done", foreground=theme.done)
+        display.tag_configure("current", foreground=theme.text)
+        display.tag_configure("error", foreground=theme.error)
+        display.tag_configure(
+            "sep", foreground=theme.faint, font=self.separator_font
+        )
+        display.tag_configure("caret", foreground=theme.accent)
+
+        chunks = (
+            split_typed_chunks(self.sentence, result.normalized)
+            if self.sentence is not None and result is not None
+            else ()
+        )
+        for index, chunk in enumerate(chunks):
+            if index:
+                display.insert("end", " ", "sep")
+            if result is not None and result.is_complete:
+                tag = "done"
+            elif chunk.char_index is None:
+                tag = "error"
+            else:
+                item = self.sentence.chars[chunk.char_index]
+                if result is not None and item.end <= result.common_prefix:
+                    tag = "done"
+                elif result is not None and result.has_error:
+                    tag = "error"
+                else:
+                    tag = "current"
+            display.insert("end", chunk.text, tag)
+
+        if result is None or not result.is_complete:
+            if chunks:
+                display.insert("end", " ", "sep")
+            display.insert("end", "|", "caret")
+
+        display.see("end")
+        display.configure(state="disabled")
+        self.input_entry.configure(
+            bg=theme.surface,
+            fg=theme.surface,
+            insertbackground=theme.surface,
+            selectbackground=theme.surface,
+            selectforeground=theme.surface,
+        )
 
     # ------------------------------------------------------------------
     # Timer and stats
@@ -934,15 +1391,65 @@ class PinyinTrainerApp:
     # ------------------------------------------------------------------
     # Sentence rendering
     # ------------------------------------------------------------------
-    def _on_sentence_configure(self, event: tk.Event) -> None:
-        if abs(event.width - self._last_card_width) < 4:
+    def _on_sentence_canvas_configure(self, event: tk.Event) -> None:
+        if abs(event.width - self._last_canvas_width) >= 4:
+            self._last_canvas_width = event.width
+            self._schedule_layout()
+        else:
+            self._update_sentence_geometry()
+
+    def _on_sentence_wheel(self, event):
+        if event.state & 0x0004:  # Ctrl+wheel is reserved for font size.
+            return None
+        step = -1 if event.delta > 0 else 1
+        self.sentence_canvas.yview_scroll(step, "units")
+        return "break"
+
+    def _update_sentence_geometry(self) -> None:
+        if not hasattr(self, "sentence_canvas"):
             return
-        self._last_card_width = event.width
-        self._schedule_layout()
+        canvas_width = self.sentence_canvas.winfo_width()
+        canvas_height = self.sentence_canvas.winfo_height()
+        if canvas_width <= 1 or canvas_height <= 1:
+            # The <Configure> event will call us again once the canvas is
+            # mapped.  Never self-reschedule here: update() would never return.
+            return
+
+        self.sentence_content.update_idletasks()
+        content_height = self.sentence_content.winfo_reqheight()
+        self.sentence_canvas.itemconfigure(
+            self._sentence_window, width=canvas_width
+        )
+        needs_scrollbar = content_height + 40 > canvas_height
+        if needs_scrollbar:
+            if not self._scrollbar_visible:
+                self.sentence_scrollbar.place(
+                    relx=1.0,
+                    y=0,
+                    anchor="ne",
+                    relheight=1.0,
+                    width=8,
+                )
+                self._scrollbar_visible = True
+            y = 20
+            scroll_height = content_height + 40
+        else:
+            if self._scrollbar_visible:
+                self.sentence_scrollbar.place_forget()
+                self._scrollbar_visible = False
+            y = max(20, (canvas_height - content_height) // 2)
+            scroll_height = canvas_height
+            self.sentence_canvas.yview_moveto(0)
+        self.sentence_canvas.coords(self._sentence_window, 0, y)
+        self.sentence_canvas.configure(
+            scrollregion=(0, 0, canvas_width, scroll_height)
+        )
+        if self._scrollbar_visible:
+            self.sentence_scrollbar.set(*self.sentence_canvas.yview())
 
     def _schedule_layout(self, force: bool = False) -> None:
         if force:
-            self._last_card_width = 0
+            self._last_canvas_width = 0
         if self._layout_job is not None:
             try:
                 self.root.after_cancel(self._layout_job)
@@ -955,6 +1462,7 @@ class PinyinTrainerApp:
         for child in self.sentence_content.winfo_children():
             child.destroy()
         self.char_labels = []
+        self.pinyin_labels = []
 
         if self.sentence is None:
             label = tk.Label(
@@ -967,34 +1475,59 @@ class PinyinTrainerApp:
             label.pack()
             return
 
-        card_width = self.sentence_card.winfo_width()
-        if card_width <= 1:
-            card_width = self.root.winfo_width() - 120
-        self._last_card_width = card_width
-        available = max(320, card_width - 64)
+        canvas_width = self.sentence_canvas.winfo_width()
+        if canvas_width <= 1:
+            canvas_width = self.root.winfo_width() - 160
+        self._last_canvas_width = canvas_width
+        available = max(320, canvas_width - 64)
 
         rows: list[list[tuple[int, object, int]]] = []
         row: list[tuple[int, object, int]] = []
         row_width = 0
         for index, item in enumerate(self.sentence.chars):
-            label_width = (
-                self.cjk_font.measure(item.char) + 2 * 4 + 2 * 2
-            )
-            if row and row_width + label_width > available:
+            char_width = self.cjk_font.measure(item.char) + 2 * 4 + 2 * 2
+            cell_width = char_width
+            if self.show_pinyin:
+                hint_text = item.pinyin if item.is_han else " "
+                hint_width = self.hint_font.measure(hint_text) + 2 * 4
+                cell_width = max(char_width, hint_width)
+            if row and row_width + cell_width > available:
                 rows.append(row)
                 row = []
                 row_width = 0
-            row.append((index, item, label_width))
-            row_width += label_width
+            row.append((index, item, cell_width))
+            row_width += cell_width
         if row:
             rows.append(row)
 
         for row_items in rows:
             row_frame = tk.Frame(self.sentence_content, bg=self.theme.surface)
             row_frame.pack(anchor="center", pady=2)
+            row_frame.bind("<MouseWheel>", self._on_sentence_wheel)
             for index, item, _width in row_items:
+                cell = tk.Frame(row_frame, bg=self.theme.surface)
+                cell.pack(side="left")
+                cell.bind("<MouseWheel>", self._on_sentence_wheel)
+
+                if self.show_pinyin:
+                    hint = tk.Label(
+                        cell,
+                        text=item.pinyin if item.is_han else " ",
+                        font=self.hint_font,
+                        bg=self.theme.surface,
+                        fg=self.theme.muted,
+                        padx=4,
+                        pady=0,
+                        bd=0,
+                    )
+                    hint.pack(anchor="center")
+                    hint.bind("<MouseWheel>", self._on_sentence_wheel)
+                    self.pinyin_labels.append(hint)
+                else:
+                    self.pinyin_labels.append(None)
+
                 label = tk.Label(
-                    row_frame,
+                    cell,
                     text=item.char,
                     font=self.cjk_font,
                     bg=self.theme.surface,
@@ -1006,10 +1539,13 @@ class PinyinTrainerApp:
                     highlightbackground=self.theme.surface,
                     highlightcolor=self.theme.current_ring,
                 )
-                label.pack(side="left")
+                label.pack(anchor="center")
+                label.bind("<MouseWheel>", self._on_sentence_wheel)
                 self.char_labels.append(label)
 
         self._refresh_char_states()
+        self._update_sentence_geometry()
+        self.sentence_canvas.yview_moveto(0)
 
     def _refresh_char_states(self) -> None:
         if not self.char_labels or self.sentence is None:
@@ -1019,12 +1555,19 @@ class PinyinTrainerApp:
         for index, (label, item) in enumerate(
             zip(self.char_labels, self.sentence.chars)
         ):
+            hint = (
+                self.pinyin_labels[index]
+                if index < len(self.pinyin_labels)
+                else None
+            )
             if not item.is_han:
                 label.configure(
                     bg=theme.surface,
                     fg=theme.faint,
                     highlightbackground=theme.surface,
                 )
+                if hint is not None:
+                    hint.configure(fg=theme.faint)
                 continue
             is_done = result is not None and item.end <= result.common_prefix
             is_current = result is not None and result.current_index == index
@@ -1046,6 +1589,13 @@ class PinyinTrainerApp:
                     fg=theme.text,
                     highlightbackground=theme.surface,
                 )
+            if hint is not None:
+                if is_current:
+                    hint.configure(fg=theme.accent)
+                elif is_done:
+                    hint.configure(fg=theme.done)
+                else:
+                    hint.configure(fg=theme.muted)
 
     # ------------------------------------------------------------------
     # Status and shutdown
@@ -1073,6 +1623,272 @@ class PinyinTrainerApp:
             self._layout_job = None
         self._save_settings()
         self.root.destroy()
+
+
+class StatsWindow(tk.Toplevel):
+    """Modal three-period view of the most frequently mistyped Hanzi."""
+
+    def __init__(self, app: PinyinTrainerApp) -> None:
+        super().__init__(app.root)
+        self.app = app
+        self.theme = app.theme
+        self.title("错字统计")
+        self.configure(bg=self.theme.bg)
+        self.transient(app.root)
+        self.minsize(900, 560)
+
+        width, height = 1000, 650
+        self.update_idletasks()
+        x = app.root.winfo_rootx() + max(
+            0, (app.root.winfo_width() - width) // 2
+        )
+        y = app.root.winfo_rooty() + max(
+            0, (app.root.winfo_height() - height) // 2
+        )
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+        self._pick_fonts()
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda _event: self.close())
+        self.grab_set()
+        self.focus_set()
+
+    def _pick_fonts(self) -> None:
+        self.heading_font = tkfont.Font(
+            self, family=self.app.cjk_family, size=-26, weight="bold"
+        )
+        self.period_font = tkfont.Font(
+            self, family=self.app.cjk_family, size=-18, weight="bold"
+        )
+        self.char_font = tkfont.Font(
+            self, family=self.app.cjk_family, size=-26
+        )
+        self.body_font = tkfont.Font(
+            self, family=self.app.cjk_family, size=-13
+        )
+        self.small_font = tkfont.Font(
+            self, family=self.app.cjk_family, size=-11
+        )
+        self.count_font = tkfont.Font(
+            self, family=self.app.mono_family, size=-15, weight="bold"
+        )
+        self.button_font = tkfont.Font(
+            self, family=self.app.cjk_family, size=-13
+        )
+
+    def _build(self) -> None:
+        theme = self.theme
+        container = tk.Frame(self, bg=theme.bg)
+        container.pack(fill="both", expand=True, padx=24, pady=20)
+
+        header = tk.Frame(container, bg=theme.bg)
+        header.pack(fill="x")
+        title = tk.Label(
+            header,
+            text="错字统计",
+            font=self.heading_font,
+            bg=theme.bg,
+            fg=theme.text,
+        )
+        title.pack(side="left")
+        close_button = ThemedButton(
+            header,
+            text="关闭",
+            command=self.close,
+            kind="soft",
+            font=self.button_font,
+            padx=14,
+            pady=5,
+        )
+        close_button.pack(side="right")
+        close_button.set_theme(theme)
+
+        subtitle = tk.Label(
+            container,
+            text="只统计未显示拼音提示时的打错汉字 · 本周从周一开始",
+            font=self.small_font,
+            bg=theme.bg,
+            fg=theme.muted,
+        )
+        subtitle.pack(anchor="w", pady=(4, 0))
+
+        self.body = tk.Frame(container, bg=theme.bg)
+        self.body.pack(fill="both", expand=True, pady=(16, 0))
+        for column in range(len(PERIODS)):
+            self.body.columnconfigure(column, weight=1)
+        self.body.rowconfigure(0, weight=1)
+
+        self._build_cards()
+
+        footer = tk.Frame(container, bg=theme.bg)
+        footer.pack(fill="x", pady=(12, 0))
+        note = tk.Label(
+            footer,
+            text="每个时间段按错误次数排序，最多显示 10 个汉字。",
+            font=self.small_font,
+            bg=theme.bg,
+            fg=theme.muted,
+        )
+        note.pack(side="left")
+        clear_button = ThemedButton(
+            footer,
+            text="清空统计",
+            command=self._clear,
+            kind="soft",
+            font=self.button_font,
+            padx=12,
+            pady=5,
+        )
+        clear_button.pack(side="right")
+        clear_button.set_theme(theme)
+
+    def _build_cards(self) -> None:
+        for child in self.body.winfo_children():
+            child.destroy()
+
+        now = datetime.now().astimezone()
+        for column, period in enumerate(PERIODS):
+            summary = self.app.stats_store.summary(period, now)
+            self._build_period_card(column, period, summary, now)
+
+    def _build_period_card(self, column: int, period: str, summary, now) -> None:
+        theme = self.theme
+        card = tk.Frame(
+            self.body,
+            bg=theme.surface,
+            highlightthickness=1,
+            highlightbackground=theme.border,
+            highlightcolor=theme.border,
+        )
+        card.grid(
+            row=0,
+            column=column,
+            sticky="nsew",
+            padx=(0, 12) if column < len(PERIODS) - 1 else 0,
+        )
+
+        head = tk.Frame(card, bg=theme.surface)
+        head.pack(fill="x", padx=16, pady=(14, 0))
+        label = tk.Label(
+            head,
+            text=PERIOD_LABELS[period],
+            font=self.period_font,
+            bg=theme.surface,
+            fg=theme.text,
+        )
+        label.pack(side="left")
+        total = tk.Label(
+            head,
+            text=f"{summary.total} 次",
+            font=self.body_font,
+            bg=theme.surface,
+            fg=theme.accent,
+        )
+        total.pack(side="right")
+
+        range_text = self._period_range(period, now)
+        meta = tk.Label(
+            card,
+            text=range_text,
+            font=self.small_font,
+            bg=theme.surface,
+            fg=theme.muted,
+        )
+        meta.pack(anchor="w", padx=16, pady=(1, 8))
+
+        separator = tk.Frame(card, bg=theme.border, height=1)
+        separator.pack(fill="x", padx=16)
+
+        list_frame = tk.Frame(card, bg=theme.surface)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=8)
+
+        if not summary.items:
+            empty = tk.Label(
+                list_frame,
+                text="暂无错误记录",
+                font=self.body_font,
+                bg=theme.surface,
+                fg=theme.faint,
+            )
+            empty.pack(pady=24)
+            return
+
+        for rank, item in enumerate(summary.items[:10], start=1):
+            row = tk.Frame(list_frame, bg=theme.surface)
+            row.pack(fill="x", pady=2)
+
+            rank_label = tk.Label(
+                row,
+                text=str(rank),
+                width=2,
+                anchor="w",
+                font=self.small_font,
+                bg=theme.surface,
+                fg=theme.accent if rank <= 3 else theme.faint,
+            )
+            rank_label.pack(side="left")
+            char_label = tk.Label(
+                row,
+                text=item.char,
+                width=2,
+                font=self.char_font,
+                bg=theme.surface,
+                fg=theme.text,
+            )
+            char_label.pack(side="left")
+            count_label = tk.Label(
+                row,
+                text=f"×{item.count}",
+                font=self.count_font,
+                bg=theme.surface,
+                fg=theme.accent,
+            )
+            count_label.pack(side="left", padx=(2, 0))
+            last_label = tk.Label(
+                row,
+                text=self._last_time(item.last_at, now),
+                font=self.small_font,
+                bg=theme.surface,
+                fg=theme.muted,
+            )
+            last_label.pack(side="right")
+
+    @staticmethod
+    def _period_range(period: str, now: datetime) -> str:
+        if period == "today":
+            return now.strftime("%Y-%m-%d")
+        if period == "week":
+            start = now - timedelta(days=now.weekday())
+            return f"{start:%m-%d} 至 {now:%m-%d}"
+        return now.strftime("%Y 年 %m 月")
+
+    @staticmethod
+    def _last_time(at: datetime, now: datetime) -> str:
+        local = at.astimezone(now.tzinfo)
+        if local.date() == now.date():
+            return local.strftime("最后 %H:%M")
+        return local.strftime("最后 %m-%d %H:%M")
+
+    def _clear(self) -> None:
+        if not messagebox.askyesno(
+            "清空统计",
+            "确定清空所有错字记录吗？此操作不可撤销。",
+            parent=self,
+        ):
+            return
+        self.app.stats_store.clear()
+        self._build_cards()
+        self.app._set_status("错字统计已清空。", "info")
+
+    def close(self) -> None:
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.app._stats_window = None
+        self.destroy()
+        self.app._restore_focus()
 
 
 def run() -> None:
