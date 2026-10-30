@@ -13,6 +13,7 @@ from trainer import (
     load_sentences,
     normalize_input,
     speed_cpm,
+    split_typed_chunks,
 )
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -43,8 +44,25 @@ class SentenceParsingTests(unittest.TestCase):
 
     def test_all_shipped_sentences_parse(self) -> None:
         library = load_sentences(PROJECT_DIR / "sentences.txt")
-        self.assertGreaterEqual(library.count, 60)
+        self.assertGreaterEqual(library.count, 100)
         self.assertEqual(len(library.skipped), 0)
+        self.assertIn("小学语文课文", library.groups)
+        self.assertIn("日常生活", library.groups)
+
+    def test_group_heading_styles(self) -> None:
+        content = (
+            "# [日常生活]\n"
+            "今天天气真好。\n"
+            "# ---------- 小学语文课文 ----------\n"
+            "弯弯的月儿小小的船。\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "sentences.txt"
+            path.write_text(content, encoding="utf-8")
+            library = load_sentences(path)
+        self.assertEqual(library.groups, ("日常生活", "小学语文课文"))
+        self.assertEqual(library.sentences[0].group, "日常生活")
+        self.assertEqual(library.sentences[1].group, "小学语文课文")
 
     def test_empty_sentence_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -128,6 +146,33 @@ class FormattingTests(unittest.TestCase):
     def test_speed(self) -> None:
         self.assertAlmostEqual(speed_cpm(120, 60), 120.0)
         self.assertEqual(speed_cpm(12, 0), 0.0)
+
+
+class TypedChunkTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.sentence = Sentence.from_text("你好，世界！")
+
+    def test_empty_input_has_no_chunks(self) -> None:
+        self.assertEqual(split_typed_chunks(self.sentence, ""), ())
+
+    def test_complete_syllable_starts_next_chunk(self) -> None:
+        chunks = split_typed_chunks(self.sentence, "nih")
+        self.assertEqual(
+            [(chunk.text, chunk.char_index) for chunk in chunks],
+            [("ni", 0), ("h", 1)],
+        )
+
+    def test_punctuation_creates_no_chunk(self) -> None:
+        chunks = split_typed_chunks(self.sentence, "nihaoshijie")
+        self.assertEqual(
+            [chunk.text for chunk in chunks],
+            ["ni", "hao", "shi", "jie"],
+        )
+
+    def test_extra_input_becomes_an_error_chunk(self) -> None:
+        chunks = split_typed_chunks(self.sentence, "nihaoshijiex")
+        self.assertEqual(chunks[-1].text, "x")
+        self.assertIsNone(chunks[-1].char_index)
 
 
 class SentenceBagTests(unittest.TestCase):
