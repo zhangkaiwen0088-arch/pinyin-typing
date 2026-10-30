@@ -16,6 +16,11 @@ from pypinyin import Style, pinyin
 
 HAN_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 LATIN_ONLY = re.compile(r"[^a-z]")
+GROUP_BRACKET_PATTERN = re.compile(r"^#\s*\[(.+?)\]\s*$")
+GROUP_RULE_PATTERN = re.compile(
+    r"^#\s*(?:-{2,}|={2,})\s*(.+?)\s*(?:-{2,}|={2,})\s*$"
+)
+DEFAULT_GROUP = "未分组"
 
 
 def is_han(char: str) -> bool:
@@ -58,10 +63,12 @@ class Sentence:
     chars: tuple[SentenceChar, ...]
     target: str
     han_count: int
+    group: str = DEFAULT_GROUP
 
     @classmethod
-    def from_text(cls, text: str) -> "Sentence":
+    def from_text(cls, text: str, group: str = DEFAULT_GROUP) -> "Sentence":
         text = text.strip()
+        group = group.strip() or DEFAULT_GROUP
         if not text:
             raise ValueError("句子为空")
 
@@ -98,7 +105,13 @@ class Sentence:
         if not target or han_count == 0:
             raise ValueError("句子中没有可练习的汉字")
 
-        return cls(text=text, chars=tuple(chars), target=target, han_count=han_count)
+        return cls(
+            text=text,
+            chars=tuple(chars),
+            target=target,
+            han_count=han_count,
+            group=group,
+        )
 
     @property
     def char_count(self) -> int:
@@ -168,6 +181,41 @@ def format_duration(seconds: float) -> str:
     return f"{minutes:02d}:{whole_seconds:02d}.{tenths}"
 
 
+@dataclass(frozen=True, slots=True)
+class TypedChunk:
+    """A run of typed pinyin belonging to one target syllable."""
+
+    text: str
+    char_index: int | None
+
+
+def split_typed_chunks(sentence: Sentence, normalized: str) -> tuple[TypedChunk, ...]:
+    """Split continuous typed pinyin on the target syllable boundaries.
+
+    The returned chunks can be rendered with a small gap between them, so
+    learners do not have to type spaces while still seeing syllable groups.
+    """
+    chunks: list[TypedChunk] = []
+    if not normalized:
+        return ()
+
+    for index, item in enumerate(sentence.chars):
+        if not item.is_han:
+            continue
+        if item.start >= len(normalized):
+            break
+        text = normalized[item.start : min(item.end, len(normalized))]
+        if text:
+            chunks.append(TypedChunk(text=text, char_index=index))
+
+    if len(normalized) > len(sentence.target):
+        extra = normalized[len(sentence.target) :]
+        if extra:
+            chunks.append(TypedChunk(text=extra, char_index=None))
+
+    return tuple(chunks)
+
+
 def speed_cpm(char_count: int, seconds: float) -> float:
     """Characters per minute."""
     if seconds <= 0:
@@ -219,6 +267,7 @@ class SentenceBag:
 @dataclass(frozen=True, slots=True)
 class SentenceLibrary:
     sentences: tuple[Sentence, ...]
+    groups: tuple[str, ...]
     skipped: tuple[str, ...]
     source: Path
 
@@ -230,9 +279,14 @@ class SentenceLibrary:
 def load_sentences(path: str | Path) -> SentenceLibrary:
     """Read the UTF-8 sentence bank.
 
-    One sentence per line; blank lines and lines whose first non-space
-    character is ``#`` are comments.  Invalid or duplicate lines are skipped
-    and reported in ``SentenceLibrary.skipped``.
+    One sentence per line. Blank lines and ordinary lines starting with ``#``
+    are ignored.  A group can be declared with either of these heading styles:
+
+        # ---------- 日常生活 ----------
+        # [日常生活]
+
+    Invalid or duplicate lines are skipped and reported in
+    ``SentenceLibrary.skipped``.
     """
     source = Path(path)
     try:
@@ -243,13 +297,26 @@ def load_sentences(path: str | Path) -> SentenceLibrary:
     sentences: list[Sentence] = []
     skipped: list[str] = []
     seen: set[str] = set()
+    groups: list[str] = []
+    current_group = DEFAULT_GROUP
 
     for line_number, raw_line in enumerate(content.splitlines(), start=1):
         line = raw_line.strip()
-        if not line or line.startswith("#"):
+        if not line:
             continue
+
+        if line.startswith("#"):
+            match = GROUP_BRACKET_PATTERN.fullmatch(line)
+            if match is None:
+                match = GROUP_RULE_PATTERN.fullmatch(line)
+            if match is not None:
+                name = match.group(1).strip()
+                if name:
+                    current_group = name
+            continue
+
         try:
-            sentence = Sentence.from_text(line)
+            sentence = Sentence.from_text(line, group=current_group)
         except Exception as exc:  # A single bad line must not break the bank.
             skipped.append(f"第 {line_number} 行：{exc}")
             continue
@@ -258,12 +325,15 @@ def load_sentences(path: str | Path) -> SentenceLibrary:
             continue
         seen.add(sentence.text)
         sentences.append(sentence)
+        if sentence.group not in groups:
+            groups.append(sentence.group)
 
     if not sentences:
         raise ValueError(f"题库中没有有效句子：{source}")
 
     return SentenceLibrary(
         sentences=tuple(sentences),
+        groups=tuple(groups),
         skipped=tuple(skipped),
         source=source.resolve(),
     )
