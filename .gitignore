@@ -6,4 +6,5 @@ venv/
 .pytest_cache/
 .settings.json
 .stats.json
+.daily.json
 *.log

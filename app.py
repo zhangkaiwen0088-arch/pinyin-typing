@@ -23,12 +23,13 @@ from trainer import (
     speed_cpm,
     split_typed_chunks,
 )
-from stats import PERIODS, PERIOD_LABELS, StatsStore
+from stats import DailyInputStore, PERIODS, PERIOD_LABELS, StatsStore
 
 APP_DIR = Path(__file__).resolve().parent
 SENTENCES_FILE = APP_DIR / "sentences.txt"
 SETTINGS_FILE = APP_DIR / ".settings.json"
 STATS_FILE = APP_DIR / ".stats.json"
+DAILY_FILE = APP_DIR / ".daily.json"
 
 ALL_GROUPS = "全部句子"
 
@@ -346,7 +347,9 @@ class PinyinTrainerApp:
         self.group_options: list[str] = [ALL_GROUPS]
 
         self.stats_store = StatsStore(STATS_FILE)
+        self.daily_store = DailyInputStore(DAILY_FILE)
         self._error_active = False
+        self._counted_chars: set[int] = set()
         self._stats_window: StatsWindow | None = None
 
         self._pick_fonts()
@@ -368,6 +371,9 @@ class PinyinTrainerApp:
         self.timer_var = tk.StringVar(value="00:00.0")
         self.progress_var = tk.StringVar(value="0 / 0 字")
         self.speed_var = tk.StringVar(value="— 字/分")
+        self.today_input_var = tk.StringVar(
+            value=f"{self.daily_store.today_total()} 字"
+        )
         self.font_size_var = tk.StringVar(value=str(self.font_px))
         self.group_var = tk.StringVar(value=ALL_GROUPS)
         self.group_button_var = tk.StringVar(value=f"{ALL_GROUPS}  ▾")
@@ -658,6 +664,7 @@ class PinyinTrainerApp:
             ("计时", self.timer_var),
             ("本句进度", self.progress_var),
             ("速度", self.speed_var),
+            ("今日输入", self.today_input_var),
         )
         for column, (caption, variable) in enumerate(specs):
             card = tk.Frame(self.stats_frame, highlightthickness=1)
@@ -1150,6 +1157,7 @@ class PinyinTrainerApp:
         self.started_at = None
         self.finished_at = None
         self._error_active = False
+        self._counted_chars = set()
         self.analysis = analyse(self.sentence, "") if self.sentence else None
         self._set_status(status, "muted")
         self.input_entry.configure(state="normal")
@@ -1243,6 +1251,7 @@ class PinyinTrainerApp:
         else:
             self._error_active = False
 
+        self._record_completed_chars(result)
         self._refresh_char_states()
         self._update_stats()
         self._apply_input_visuals()
@@ -1287,10 +1296,26 @@ class PinyinTrainerApp:
         )
         self._render_input_display()
 
+    def _record_completed_chars(self, result: Analysis) -> None:
+        if self.sentence is None:
+            return
+        newly_completed = 0
+        for index, item in enumerate(self.sentence.chars):
+            if not item.is_han or item.end > result.common_prefix:
+                continue
+            if index in self._counted_chars:
+                continue
+            self._counted_chars.add(index)
+            newly_completed += 1
+        if newly_completed:
+            self.daily_store.add(newly_completed)
+            self.today_input_var.set(
+                f"{self.daily_store.today_total()} 字"
+            )
+
     def _render_input_display(self) -> None:
         if not hasattr(self, "input_display"):
             return
-
         theme = self.theme
         display = self.input_display
         result = self.analysis
@@ -1632,12 +1657,14 @@ class StatsWindow(tk.Toplevel):
         super().__init__(app.root)
         self.app = app
         self.theme = app.theme
+        self.period = "today"
+        self._table_scroll_visible = False
         self.title("错字统计")
         self.configure(bg=self.theme.bg)
         self.transient(app.root)
-        self.minsize(900, 560)
+        self.minsize(920, 600)
 
-        width, height = 1000, 650
+        width, height = 1080, 720
         self.update_idletasks()
         x = app.root.winfo_rootx() + max(
             0, (app.root.winfo_width() - width) // 2
@@ -1672,6 +1699,9 @@ class StatsWindow(tk.Toplevel):
         )
         self.count_font = tkfont.Font(
             self, family=self.app.mono_family, size=-15, weight="bold"
+        )
+        self.pinyin_font = tkfont.Font(
+            self, family=self.app.mono_family, size=-16, weight="bold"
         )
         self.button_font = tkfont.Font(
             self, family=self.app.cjk_family, size=-13
@@ -1713,19 +1743,107 @@ class StatsWindow(tk.Toplevel):
         )
         subtitle.pack(anchor="w", pady=(4, 0))
 
-        self.body = tk.Frame(container, bg=theme.bg)
-        self.body.pack(fill="both", expand=True, pady=(16, 0))
-        for column in range(len(PERIODS)):
-            self.body.columnconfigure(column, weight=1)
-        self.body.rowconfigure(0, weight=1)
+        toolbar = tk.Frame(container, bg=theme.bg)
+        toolbar.pack(fill="x", pady=(12, 0))
+        caption = tk.Label(
+            toolbar,
+            text="查看范围",
+            font=self.small_font,
+            bg=theme.bg,
+            fg=theme.muted,
+        )
+        caption.pack(side="left", padx=(0, 8))
 
-        self._build_cards()
+        self.period_buttons: dict[str, ThemedButton] = {}
+        for period in PERIODS:
+            button = ThemedButton(
+                toolbar,
+                text=PERIOD_LABELS[period],
+                command=lambda selected=period: self._select_period(selected),
+                kind="segment",
+                font=self.button_font,
+                padx=16,
+                pady=5,
+            )
+            button.pack(side="left", padx=2)
+            self.period_buttons[period] = button
+
+        self.summary_label = tk.Label(
+            container,
+            text="",
+            font=self.small_font,
+            bg=theme.bg,
+            fg=theme.muted,
+        )
+        self.summary_label.pack(anchor="w", pady=(8, 0))
+
+        self.table_card = tk.Frame(
+            container,
+            bg=theme.surface,
+            highlightthickness=1,
+            highlightbackground=theme.border,
+            highlightcolor=theme.border,
+        )
+        self.table_card.pack(fill="both", expand=True, pady=(10, 0))
+
+        header = tk.Frame(self.table_card, bg=theme.surface_alt)
+        header.pack(fill="x")
+        header.grid_columnconfigure(2, weight=1)
+        for column, text, width in (
+            (0, "拼音", 12),
+            (1, "错误次数", 8),
+            (2, "汉字（按次数排序）", 0),
+            (3, "最后出错", 14),
+        ):
+            label = tk.Label(
+                header,
+                text=text,
+                font=self.small_font,
+                bg=theme.surface_alt,
+                fg=theme.muted,
+                anchor="w",
+                width=width if width else 0,
+            )
+            label.grid(
+                row=0,
+                column=column,
+                sticky="ew" if column == 2 else "w",
+                padx=(14 if column == 0 else 4, 8),
+                pady=8,
+            )
+
+        self.table_holder = tk.Frame(self.table_card, bg=theme.surface)
+        self.table_holder.pack(fill="both", expand=True)
+        self.table_canvas = tk.Canvas(
+            self.table_holder,
+            bg=theme.surface,
+            bd=0,
+            highlightthickness=0,
+            takefocus=0,
+        )
+        self.table_canvas.pack(fill="both", expand=True)
+        self.table_scrollbar = SlimScrollbar(
+            self.table_holder,
+            command=self.table_canvas.yview,
+        )
+        self.table_scrollbar.apply_theme(theme)
+        self.table_canvas.configure(
+            yscrollcommand=self.table_scrollbar.set
+        )
+        self.table_body = tk.Frame(self.table_canvas, bg=theme.surface)
+        self._table_window = self.table_canvas.create_window(
+            (0, 0), window=self.table_body, anchor="nw"
+        )
+        self.table_body.bind("<MouseWheel>", self._on_table_wheel)
+        self.table_canvas.bind("<Configure>", self._on_table_canvas_configure)
+        self.table_canvas.bind("<MouseWheel>", self._on_table_wheel)
+        self._char_labels: list[tk.Label] = []
 
         footer = tk.Frame(container, bg=theme.bg)
         footer.pack(fill="x", pady=(12, 0))
         note = tk.Label(
             footer,
-            text="每个时间段按错误次数排序，最多显示 10 个汉字。",
+            text="只统计关闭拼音提示时的错误 · 全部显示 · 本周从周一开始",
             font=self.small_font,
             bg=theme.bg,
             fg=theme.muted,
@@ -1743,116 +1861,163 @@ class StatsWindow(tk.Toplevel):
         clear_button.pack(side="right")
         clear_button.set_theme(theme)
 
-    def _build_cards(self) -> None:
-        for child in self.body.winfo_children():
-            child.destroy()
+        self._refresh_table()
 
-        now = datetime.now().astimezone()
-        for column, period in enumerate(PERIODS):
-            summary = self.app.stats_store.summary(period, now)
-            self._build_period_card(column, period, summary, now)
+    def _select_period(self, period: str) -> None:
+        if period not in PERIODS:
+            return
+        self.period = period
+        self._refresh_table()
 
-    def _build_period_card(self, column: int, period: str, summary, now) -> None:
+    def _refresh_table(self) -> None:
         theme = self.theme
-        card = tk.Frame(
-            self.body,
-            bg=theme.surface,
-            highlightthickness=1,
-            highlightbackground=theme.border,
-            highlightcolor=theme.border,
-        )
-        card.grid(
-            row=0,
-            column=column,
-            sticky="nsew",
-            padx=(0, 12) if column < len(PERIODS) - 1 else 0,
+        now = datetime.now().astimezone()
+        summary = self.app.stats_store.summary_by_pinyin(self.period, now)
+
+        for period, button in self.period_buttons.items():
+            button.set_theme(theme, selected=(period == self.period))
+
+        range_text = self._period_range(self.period, now)
+        self.summary_label.configure(
+            text=f"{range_text} · 共 {summary.total} 次错误 · {len(summary.items)} 个拼音"
         )
 
-        head = tk.Frame(card, bg=theme.surface)
-        head.pack(fill="x", padx=16, pady=(14, 0))
-        label = tk.Label(
-            head,
-            text=PERIOD_LABELS[period],
-            font=self.period_font,
-            bg=theme.surface,
-            fg=theme.text,
-        )
-        label.pack(side="left")
-        total = tk.Label(
-            head,
-            text=f"{summary.total} 次",
-            font=self.body_font,
-            bg=theme.surface,
-            fg=theme.accent,
-        )
-        total.pack(side="right")
-
-        range_text = self._period_range(period, now)
-        meta = tk.Label(
-            card,
-            text=range_text,
-            font=self.small_font,
-            bg=theme.surface,
-            fg=theme.muted,
-        )
-        meta.pack(anchor="w", padx=16, pady=(1, 8))
-
-        separator = tk.Frame(card, bg=theme.border, height=1)
-        separator.pack(fill="x", padx=16)
-
-        list_frame = tk.Frame(card, bg=theme.surface)
-        list_frame.pack(fill="both", expand=True, padx=10, pady=8)
+        for child in self.table_body.winfo_children():
+            child.destroy()
+        self._char_labels = []
 
         if not summary.items:
             empty = tk.Label(
-                list_frame,
-                text="暂无错误记录",
+                self.table_body,
+                text="当前时间范围内没有打错记录",
                 font=self.body_font,
                 bg=theme.surface,
                 fg=theme.faint,
             )
-            empty.pack(pady=24)
+            empty.pack(pady=36)
+            self.table_body.update_idletasks()
+            self._update_table_geometry()
             return
 
-        for rank, item in enumerate(summary.items[:10], start=1):
-            row = tk.Frame(list_frame, bg=theme.surface)
-            row.pack(fill="x", pady=2)
+        for index, item in enumerate(summary.items):
+            background = theme.surface if index % 2 == 0 else theme.surface_alt
+            row = tk.Frame(self.table_body, bg=background)
+            row.pack(fill="x")
+            row.grid_columnconfigure(2, weight=1)
+            row.bind("<MouseWheel>", self._on_table_wheel)
 
-            rank_label = tk.Label(
+            pinyin_label = tk.Label(
                 row,
-                text=str(rank),
-                width=2,
+                text=item.pinyin,
+                font=self.pinyin_font,
+                bg=background,
+                fg=theme.accent,
                 anchor="w",
-                font=self.small_font,
-                bg=theme.surface,
-                fg=theme.accent if rank <= 3 else theme.faint,
+                width=12,
             )
-            rank_label.pack(side="left")
-            char_label = tk.Label(
-                row,
-                text=item.char,
-                width=2,
-                font=self.char_font,
-                bg=theme.surface,
-                fg=theme.text,
+            pinyin_label.grid(
+                row=0, column=0, sticky="w", padx=(14, 4), pady=6
             )
-            char_label.pack(side="left")
             count_label = tk.Label(
                 row,
-                text=f"×{item.count}",
+                text=str(item.count),
                 font=self.count_font,
-                bg=theme.surface,
-                fg=theme.accent,
+                bg=background,
+                fg=theme.text,
+                anchor="w",
+                width=8,
             )
-            count_label.pack(side="left", padx=(2, 0))
+            count_label.grid(row=0, column=1, sticky="w", padx=(4, 8), pady=6)
+
+            chars_text = "   ".join(
+                f"{char.char}×{char.count}" for char in item.chars
+            )
+            chars_label = tk.Label(
+                row,
+                text=chars_text,
+                font=self.body_font,
+                bg=background,
+                fg=theme.text,
+                anchor="w",
+                justify="left",
+                wraplength=520,
+            )
+            chars_label.grid(
+                row=0, column=2, sticky="ew", padx=(4, 8), pady=6
+            )
+            self._char_labels.append(chars_label)
+
             last_label = tk.Label(
                 row,
                 text=self._last_time(item.last_at, now),
                 font=self.small_font,
-                bg=theme.surface,
+                bg=background,
                 fg=theme.muted,
+                anchor="w",
+                width=14,
             )
-            last_label.pack(side="right")
+            last_label.grid(
+                row=0, column=3, sticky="w", padx=(4, 14), pady=6
+            )
+
+            for widget in (pinyin_label, count_label, chars_label, last_label):
+                widget.bind("<MouseWheel>", self._on_table_wheel)
+
+        self.table_body.update_idletasks()
+        self._update_char_wrap()
+        self._update_table_geometry()
+        self.table_canvas.yview_moveto(0)
+
+    def _update_char_wrap(self) -> None:
+        width = max(300, self.table_canvas.winfo_width() - 390)
+        for label in self._char_labels:
+            label.configure(wraplength=width)
+
+    def _on_table_canvas_configure(self, event: tk.Event) -> None:
+        self.table_canvas.itemconfigure(self._table_window, width=event.width)
+        self._update_char_wrap()
+        self._update_table_geometry()
+
+    def _update_table_geometry(self) -> None:
+        canvas_width = self.table_canvas.winfo_width()
+        canvas_height = self.table_canvas.winfo_height()
+        if canvas_width <= 1 or canvas_height <= 1:
+            return
+        self.table_body.update_idletasks()
+        body_height = self.table_body.winfo_reqheight()
+        self.table_canvas.itemconfigure(
+            self._table_window, width=canvas_width
+        )
+        if body_height > canvas_height:
+            if not self._table_scroll_visible:
+                self.table_scrollbar.place(
+                    relx=1.0,
+                    y=0,
+                    anchor="ne",
+                    relheight=1.0,
+                    width=8,
+                )
+                self._table_scroll_visible = True
+            self.table_canvas.configure(
+                scrollregion=(0, 0, canvas_width, body_height)
+            )
+        else:
+            if self._table_scroll_visible:
+                self.table_scrollbar.place_forget()
+                self._table_scroll_visible = False
+            self.table_canvas.configure(
+                scrollregion=(0, 0, canvas_width, canvas_height)
+            )
+            self.table_canvas.yview_moveto(0)
+        if self._table_scroll_visible:
+            self.table_scrollbar.set(*self.table_canvas.yview())
+
+    def _on_table_wheel(self, event):
+        if event.state & 0x0004:
+            return None
+        step = -1 if event.delta > 0 else 1
+        self.table_canvas.yview_scroll(step, "units")
+        return "break"
 
     @staticmethod
     def _period_range(period: str, now: datetime) -> str:
@@ -1878,7 +2043,7 @@ class StatsWindow(tk.Toplevel):
         ):
             return
         self.app.stats_store.clear()
-        self._build_cards()
+        self._refresh_table()
         self.app._set_status("错字统计已清空。", "info")
 
     def close(self) -> None:
