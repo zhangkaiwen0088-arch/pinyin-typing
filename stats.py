@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 PERIODS = ("today", "week", "month")
@@ -62,6 +62,21 @@ class PeriodSummary:
     period: str
     total: int
     items: tuple[HanziStat, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PinyinStat:
+    pinyin: str
+    count: int
+    last_at: datetime
+    chars: tuple[HanziStat, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PinyinPeriodSummary:
+    period: str
+    total: int
+    items: tuple[PinyinStat, ...]
 
 
 class StatsStore:
@@ -143,38 +158,45 @@ class StatsStore:
         except OSError:
             pass
 
+    @staticmethod
+    def _period_start(period: str, current: datetime) -> datetime:
+        if period not in PERIODS:
+            raise ValueError(f"unknown period: {period}")
+        if period == "today":
+            return current.replace(hour=0, minute=0, second=0, microsecond=0)
+        if period == "week":
+            return (current - timedelta(days=current.weekday())).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+        return current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    def _period_events(
+        self,
+        period: str,
+        now: datetime | None = None,
+    ) -> tuple[datetime, list[tuple[ErrorEvent, datetime]]]:
+        current = now or datetime.now().astimezone()
+        if current.tzinfo is None:
+            current = current.astimezone()
+        start = self._period_start(period, current)
+        selected: list[tuple[ErrorEvent, datetime]] = []
+        for event in self._events:
+            at = event.at.astimezone(current.tzinfo)
+            if start <= at <= current:
+                selected.append((event, at))
+        return current, selected
+
     def summary(
         self,
         period: str,
         now: datetime | None = None,
     ) -> PeriodSummary:
-        if period not in PERIODS:
-            raise ValueError(f"unknown period: {period}")
-
-        current = now or datetime.now().astimezone()
-        if current.tzinfo is None:
-            current = current.astimezone()
-
-        if period == "today":
-            start = current.replace(hour=0, minute=0, second=0, microsecond=0)
-        elif period == "week":
-            start = (current - timedelta(days=current.weekday())).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-        else:
-            start = current.replace(
-                day=1, hour=0, minute=0, second=0, microsecond=0
-            )
-
+        _current, events = self._period_events(period, now)
         counts: dict[str, int] = {}
         last_seen: dict[str, datetime] = {}
-        total = 0
-        for event in self._events:
-            at = event.at.astimezone(current.tzinfo)
-            if at < start or at > current:
-                continue
-            total += 1
-            counts[event.char] = counts.get(event.char, 0) + 1
+        for event, at in events:
+            total = counts.get(event.char, 0) + 1
+            counts[event.char] = total
             previous = last_seen.get(event.char)
             if previous is None or at > previous:
                 last_seen[event.char] = at
@@ -186,4 +208,126 @@ class StatsStore:
                 key=lambda pair: (-pair[1], -last_seen[pair[0]].timestamp(), pair[0]),
             )
         )
-        return PeriodSummary(period=period, total=total, items=items)
+        return PeriodSummary(period=period, total=len(events), items=items)
+
+    def summary_by_pinyin(
+        self,
+        period: str,
+        now: datetime | None = None,
+    ) -> PinyinPeriodSummary:
+        """Aggregate errors by target pinyin.
+
+        For example, all ``shi`` mistakes are grouped together even when they
+        were made on different characters such as 是 and 事.
+        """
+        _current, events = self._period_events(period, now)
+
+        group_counts: dict[str, int] = {}
+        group_last: dict[str, datetime] = {}
+        char_counts: dict[str, dict[str, int]] = {}
+        char_last: dict[str, dict[str, datetime]] = {}
+
+        for event, at in events:
+            pinyin = event.target.strip() or "—"
+            group_counts[pinyin] = group_counts.get(pinyin, 0) + 1
+            previous = group_last.get(pinyin)
+            if previous is None or at > previous:
+                group_last[pinyin] = at
+
+            per_char = char_counts.setdefault(pinyin, {})
+            per_char[event.char] = per_char.get(event.char, 0) + 1
+            per_last = char_last.setdefault(pinyin, {})
+            old = per_last.get(event.char)
+            if old is None or at > old:
+                per_last[event.char] = at
+
+        items: list[PinyinStat] = []
+        for pinyin, count in group_counts.items():
+            chars = tuple(
+                HanziStat(char=char, count=char_count, last_at=char_last[pinyin][char])
+                for char, char_count in sorted(
+                    char_counts[pinyin].items(),
+                    key=lambda pair: (
+                        -pair[1],
+                        -char_last[pinyin][pair[0]].timestamp(),
+                        pair[0],
+                    ),
+                )
+            )
+            items.append(
+                PinyinStat(
+                    pinyin=pinyin,
+                    count=count,
+                    last_at=group_last[pinyin],
+                    chars=chars,
+                )
+            )
+
+        items.sort(key=lambda item: (-item.count, item.pinyin))
+        return PinyinPeriodSummary(
+            period=period,
+            total=len(events),
+            items=tuple(items),
+        )
+
+
+class DailyInputStore:
+    """Persistent per-day count of completed pinyin syllables."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._days: dict[str, int] = {}
+        self._load()
+
+    @property
+    def days(self) -> dict[str, int]:
+        return dict(self._days)
+
+    def _load(self) -> None:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return
+        days = raw.get("days", {}) if isinstance(raw, dict) else {}
+        if not isinstance(days, dict):
+            return
+        for day, count in days.items():
+            try:
+                value = int(count)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                self._days[str(day)] = value
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"version": 1, "days": self._days}
+        temporary = self.path.with_name(self.path.name + ".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(self.path)
+
+    def add(self, count: int = 1, when: datetime | None = None) -> bool:
+        if count <= 0:
+            return True
+        at = when or datetime.now().astimezone()
+        if at.tzinfo is None:
+            at = at.astimezone()
+        day = at.date().isoformat()
+        self._days[day] = self._days.get(day, 0) + count
+        try:
+            self._save()
+        except OSError:
+            return False
+        return True
+
+    def total_on(self, day: date) -> int:
+        return self._days.get(day.isoformat(), 0)
+
+    def today_total(self, now: datetime | None = None) -> int:
+        current = now or datetime.now().astimezone()
+        if current.tzinfo is None:
+            current = current.astimezone()
+        return self.total_on(current.date())
