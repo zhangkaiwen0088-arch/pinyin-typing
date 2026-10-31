@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from stats import StatsStore
+from stats import DailyInputStore, StatsStore
 
 JST = timezone(timedelta(hours=9))
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=JST)
@@ -89,6 +89,48 @@ class StatsStoreTests(unittest.TestCase):
         self.assertEqual(counts["气"], 1)
         self.assertEqual(counts["地"], 1)
 
+    def test_pinyin_summary_groups_characters(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / ".stats.json"
+            store = StatsStore(path)
+            when = datetime(2026, 10, 30, 9, 0, tzinfo=JST)
+            for char, count, target in (
+                ("是", 2, "shi"),
+                ("事", 1, "shi"),
+                ("天", 1, "tian"),
+            ):
+                for index in range(count):
+                    store.record(
+                        char=char,
+                        target=target,
+                        typed=target[:2],
+                        sentence="测试。",
+                        when=when + timedelta(minutes=index),
+                    )
+            summary = store.summary_by_pinyin("today", NOW)
+        self.assertEqual(summary.total, 4)
+        self.assertEqual([item.pinyin for item in summary.items], ["shi", "tian"])
+        self.assertEqual(summary.items[0].count, 3)
+        self.assertEqual(
+            [(char.char, char.count) for char in summary.items[0].chars],
+            [("是", 2), ("事", 1)],
+        )
+
+    def test_pinyin_summary_returns_all_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / ".stats.json"
+            store = StatsStore(path)
+            for index in range(15):
+                store.record(
+                    char="字",
+                    target=f"pin{index}",
+                    typed="pin",
+                    sentence="测试。",
+                    when=NOW,
+                )
+            summary = store.summary_by_pinyin("today", NOW)
+        self.assertEqual(len(summary.items), 15)
+
     def test_persistence(self) -> None:
         reopened = StatsStore(self.path)
         self.assertEqual(len(reopened.events), 8)
@@ -110,6 +152,35 @@ class StatsStoreTests(unittest.TestCase):
     def test_invalid_period_rejected(self) -> None:
         with self.assertRaises(ValueError):
             self.store.summary("year", NOW)
+
+
+class DailyInputStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.path = Path(self._temp.name) / ".daily.json"
+        self.store = DailyInputStore(self.path)
+
+    def tearDown(self) -> None:
+        self._temp.cleanup()
+
+    def test_add_and_persist_today_total(self) -> None:
+        self.assertTrue(self.store.add(5, when=NOW))
+        self.assertTrue(self.store.add(3, when=NOW))
+        self.assertEqual(self.store.today_total(NOW), 8)
+        reopened = DailyInputStore(self.path)
+        self.assertEqual(reopened.today_total(NOW), 8)
+
+    def test_totals_are_per_local_date(self) -> None:
+        yesterday = NOW - timedelta(days=1)
+        self.store.add(4, when=yesterday)
+        self.store.add(7, when=NOW)
+        self.assertEqual(self.store.today_total(NOW), 7)
+        self.assertEqual(self.store.total_on(yesterday.date()), 4)
+
+    def test_zero_or_negative_add_is_ignored(self) -> None:
+        self.store.add(0, when=NOW)
+        self.store.add(-3, when=NOW)
+        self.assertEqual(self.store.today_total(NOW), 0)
 
 
 if __name__ == "__main__":
