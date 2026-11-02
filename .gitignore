@@ -7,4 +7,6 @@ venv/
 .settings.json
 .stats.json
 .daily.json
+build/
+dist/
 *.log

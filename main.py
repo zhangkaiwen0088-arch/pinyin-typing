@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import traceback
+
+
+def _debug(message: str) -> None:
+    if os.environ.get("PINYIN_DEBUG") == "1":
+        print(f"[pinyin-debug] {message}", file=sys.stderr, flush=True)
 
 
 def _enable_dpi_awareness() -> None:
@@ -37,7 +43,13 @@ def _show_error(title: str, message: str) -> None:
 
 
 def main() -> int:
+    if os.environ.get("PINYIN_DEBUG") == "1":
+        import faulthandler
+
+        faulthandler.dump_traceback_later(10, repeat=True)
+        _debug("main start")
     _enable_dpi_awareness()
+    _debug("dpi enabled")
 
     try:
         import pypinyin  # noqa: F401
@@ -50,18 +62,22 @@ def main() -> int:
             "然后重新启动本程序。",
         )
         return 1
+    _debug("pypinyin imported")
 
     try:
         from app import run
     except Exception:
         _show_error("启动失败", traceback.format_exc())
         return 1
+    _debug("app imported")
 
     try:
+        _debug("calling run")
         run()
     except Exception:
         _show_error("运行出错", traceback.format_exc())
         return 1
+    _debug("run returned")
     return 0
 
 
