@@ -8,9 +8,10 @@ import time
 import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import messagebox
+
+from paths import DAILY_FILE, SETTINGS_FILE, STATS_FILE, SENTENCES_FILE
 
 from trainer import (
     Analysis,
@@ -23,13 +24,8 @@ from trainer import (
     speed_cpm,
     split_typed_chunks,
 )
-from stats import DailyInputStore, PERIODS, PERIOD_LABELS, StatsStore
-
-APP_DIR = Path(__file__).resolve().parent
-SENTENCES_FILE = APP_DIR / "sentences.txt"
-SETTINGS_FILE = APP_DIR / ".settings.json"
-STATS_FILE = APP_DIR / ".stats.json"
-DAILY_FILE = APP_DIR / ".daily.json"
+from stats import DailyInputStore, PERIODS, StatsStore
+from i18n import DEFAULT_LANGUAGE, LANGUAGES, group_label, tr
 
 ALL_GROUPS = "全部句子"
 
@@ -210,14 +206,14 @@ class ThemedButton(tk.Button):
 class ThemeToggle(tk.Frame):
     """Small segmented control for the light/dark theme."""
 
-    def __init__(self, master: tk.Misc, *, font, on_change) -> None:
+    def __init__(self, master: tk.Misc, *, font, lang: str, on_change) -> None:
         super().__init__(master, bd=0, highlightthickness=0)
         self._on_change = on_change
         self.buttons: dict[str, ThemedButton] = {}
         for key in ("light", "dark"):
             button = ThemedButton(
                 self,
-                text=THEMES[key].label,
+                text=tr(lang, "theme_light" if key == "light" else "theme_dark"),
                 command=lambda value=key: self._on_change(value),
                 kind="segment",
                 font=font,
@@ -231,6 +227,44 @@ class ThemeToggle(tk.Frame):
         self.configure(bg=theme.surface_alt)
         for key, button in self.buttons.items():
             button.set_theme(theme, selected=(key == active_key))
+
+    def apply_language(self, lang: str) -> None:
+        self.buttons["light"].configure(text=tr(lang, "theme_light"))
+        self.buttons["dark"].configure(text=tr(lang, "theme_dark"))
+
+
+class LanguageToggle(tk.Frame):
+    """Two-button language switcher."""
+
+    def __init__(self, master: tk.Misc, *, font, lang: str, on_change) -> None:
+        super().__init__(master, bd=0, highlightthickness=0)
+        self._on_change = on_change
+        self.buttons: dict[str, ThemedButton] = {}
+        for key, label in (("zh", "中文"), ("en", "EN")):
+            button = ThemedButton(
+                self,
+                text=label,
+                command=lambda value=key: self._on_change(value),
+                kind="segment",
+                font=font,
+                padx=9,
+                pady=5,
+            )
+            button.pack(side="left", padx=2, pady=2)
+            self.buttons[key] = button
+        self.lang = lang
+        self._theme: Theme | None = None
+
+    def apply_theme(self, theme: Theme) -> None:
+        self._theme = theme
+        self.configure(bg=theme.surface_alt)
+        for key, button in self.buttons.items():
+            button.set_theme(theme, selected=(key == self.lang))
+
+    def apply_language(self, lang: str) -> None:
+        self.lang = lang
+        if self._theme is not None:
+            self.apply_theme(self._theme)
 
 
 class SlimScrollbar(tk.Canvas):
@@ -314,12 +348,15 @@ class SlimScrollbar(tk.Canvas):
 class PinyinTrainerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("拼音打字练习")
+        self.root.title(tr(DEFAULT_LANGUAGE, "app_title"))
         self.root.minsize(1040, 760)
         self.root.geometry(self._centred_geometry(1240, 900))
         self.root.configure(bg=THEMES["light"].bg)
 
         self.settings = self._load_settings()
+        raw_lang = self.settings.get("language", DEFAULT_LANGUAGE)
+        self.lang = raw_lang if raw_lang in LANGUAGES else DEFAULT_LANGUAGE
+        self.root.title(tr(self.lang, "app_title"))
         theme_key = self.settings.get("theme", "light")
         self.theme_key = (
             theme_key
@@ -365,18 +402,28 @@ class PinyinTrainerApp:
         self._layout_job: str | None = None
         self._last_canvas_width = 0
 
-        self._status_text = "输入第一个字母后开始计时。"
+        self._status_text = tr(self.lang, "status_start")
         self._status_kind = "muted"
 
         self.timer_var = tk.StringVar(value="00:00.0")
-        self.progress_var = tk.StringVar(value="0 / 0 字")
-        self.speed_var = tk.StringVar(value="— 字/分")
+        self.progress_var = tk.StringVar(
+            value=tr(self.lang, "progress_value", done=0, total=0)
+        )
+        self.speed_var = tk.StringVar(
+            value=tr(self.lang, "value_cpm_empty")
+        )
         self.today_input_var = tk.StringVar(
-            value=f"{self.daily_store.today_total()} 字"
+            value=tr(
+                self.lang,
+                "value_chars",
+                count=self.daily_store.today_total(),
+            )
         )
         self.font_size_var = tk.StringVar(value=str(self.font_px))
         self.group_var = tk.StringVar(value=ALL_GROUPS)
-        self.group_button_var = tk.StringVar(value=f"{ALL_GROUPS}  ▾")
+        self.group_button_var = tk.StringVar(
+            value=f"{group_label(self.lang, ALL_GROUPS)}  ▾"
+        )
         self.hint_var = tk.BooleanVar(value=self.show_pinyin)
 
         self.char_labels: list[tk.Label] = []
@@ -422,6 +469,7 @@ class PinyinTrainerApp:
             "font_size": self.font_px,
             "show_pinyin": self.show_pinyin,
             "group": self.group_name,
+            "language": self.lang,
         }
         try:
             SETTINGS_FILE.write_text(
@@ -533,11 +581,13 @@ class PinyinTrainerApp:
 
         left = tk.Frame(self.header)
         left.pack(side="left")
-        self.title_label = tk.Label(left, text="拼音打字练习", font=self.title_font)
+        self.title_label = tk.Label(
+            left, text=tr(self.lang, "app_title"), font=self.title_font
+        )
         self.title_label.pack(anchor="w")
         self.subtitle_label = tk.Label(
             left,
-            text="题库加载中…",
+            text=tr(self.lang, "subtitle_loading"),
             font=self.subtitle_font,
         )
         self.subtitle_label.pack(anchor="w", pady=(3, 0))
@@ -547,7 +597,7 @@ class PinyinTrainerApp:
 
         self.next_button = ThemedButton(
             right,
-            text="换一句",
+            text=tr(self.lang, "next_sentence"),
             command=self._next_sentence,
             kind="primary",
             font=self.button_font,
@@ -560,7 +610,7 @@ class PinyinTrainerApp:
         font_group = self.font_group
         font_group.pack(side="right", padx=(0, 16))
         self.font_caption = tk.Label(
-            font_group, text="字号", font=self.small_font
+            font_group, text=tr(self.lang, "font_size"), font=self.small_font
         )
         self.font_caption.pack(side="left", padx=(0, 6))
 
@@ -591,9 +641,17 @@ class PinyinTrainerApp:
         self.font_plus.pack(side="left")
 
         self.theme_toggle = ThemeToggle(
-            right, font=self.button_font, on_change=self._set_theme
+            right, font=self.button_font, lang=self.lang, on_change=self._set_theme
         )
         self.theme_toggle.pack(side="right", padx=(0, 16))
+
+        self.language_toggle = LanguageToggle(
+            right,
+            font=self.button_font,
+            lang=self.lang,
+            on_change=self._set_language,
+        )
+        self.language_toggle.pack(side="right", padx=(0, 16))
 
     def _build_filter_bar(self) -> None:
         self.filter_bar = tk.Frame(self.container)
@@ -602,14 +660,14 @@ class PinyinTrainerApp:
         left = tk.Frame(self.filter_bar)
         left.pack(side="left")
         self.group_caption = tk.Label(
-            left, text="练习分组", font=self.small_font
+            left, text=tr(self.lang, "practice_group"), font=self.small_font
         )
         self.group_caption.pack(side="left", padx=(0, 8))
         self.group_menu = tk.Menubutton(
             left,
             textvariable=self.group_button_var,
             font=self.ui_font,
-            width=14,
+            width=22,
             anchor="w",
             relief="flat",
             bd=0,
@@ -628,7 +686,7 @@ class PinyinTrainerApp:
 
         self.hint_check = tk.Checkbutton(
             self.filter_bar,
-            text="显示拼音提示",
+            text=tr(self.lang, "show_hints"),
             variable=self.hint_var,
             command=self._on_hint_toggle,
             font=self.small_font,
@@ -646,11 +704,13 @@ class PinyinTrainerApp:
         menu.delete(0, "end")
         for name in self.group_options:
             menu.add_command(
-                label=name,
+                label=group_label(self.lang, name),
                 command=lambda selected=name: self._select_group(selected),
             )
         self.group_var.set(self.group_name)
-        self.group_button_var.set(f"{self.group_name}  ▾")
+        self.group_button_var.set(
+            f"{group_label(self.lang, self.group_name)}  ▾"
+        )
 
     def _build_stats(self) -> None:
         self.stats_frame = tk.Frame(self.container)
@@ -661,12 +721,12 @@ class PinyinTrainerApp:
         self.stat_values: list[tk.Label] = []
 
         specs = (
-            ("计时", self.timer_var),
-            ("本句进度", self.progress_var),
-            ("速度", self.speed_var),
-            ("今日输入", self.today_input_var),
+            ("stat_time", self.timer_var),
+            ("stat_progress", self.progress_var),
+            ("stat_speed", self.speed_var),
+            ("stat_today", self.today_input_var),
         )
-        for column, (caption, variable) in enumerate(specs):
+        for column, (caption_key, variable) in enumerate(specs):
             card = tk.Frame(self.stats_frame, highlightthickness=1)
             card.grid(
                 row=0,
@@ -675,7 +735,11 @@ class PinyinTrainerApp:
                 padx=(0, 12) if column < len(specs) - 1 else 0,
             )
             self.stats_frame.columnconfigure(column, weight=1)
-            caption_label = tk.Label(card, text=caption, font=self.caption_font)
+            caption_label = tk.Label(
+                card,
+                text=tr(self.lang, caption_key),
+                font=self.caption_font,
+            )
             caption_label.pack(anchor="w", padx=16, pady=(10, 0))
             value_label = tk.Label(
                 card,
@@ -729,12 +793,12 @@ class PinyinTrainerApp:
         top = self.input_top
         top.pack(fill="x")
         self.input_title = tk.Label(
-            top, text="输入拼音", font=self.ui_font
+            top, text=tr(self.lang, "input_title"), font=self.ui_font
         )
         self.input_title.pack(side="left")
         self.input_hint = tk.Label(
             top,
-            text="无需声调 · 无需空格 · 自动分字",
+            text=tr(self.lang, "input_hint"),
             font=self.small_font,
         )
         self.input_hint.pack(side="right")
@@ -805,7 +869,7 @@ class PinyinTrainerApp:
 
         self.footer_hint = tk.Label(
             self.footer,
-            text="Backspace 删除   ·   Enter 下一句   ·   Ctrl+R 重开   ·   F5 重载",
+            text=tr(self.lang, "footer_hint"),
             font=self.small_font,
             anchor="w",
         )
@@ -813,7 +877,7 @@ class PinyinTrainerApp:
 
         self.open_button = ThemedButton(
             self.footer,
-            text="打开题库",
+            text=tr(self.lang, "open_bank"),
             command=self._open_library,
             kind="soft",
             font=self.button_font,
@@ -824,7 +888,7 @@ class PinyinTrainerApp:
 
         self.reload_button = ThemedButton(
             self.footer,
-            text="重新加载题库",
+            text=tr(self.lang, "reload_bank"),
             command=self._reload_library,
             kind="soft",
             font=self.button_font,
@@ -835,7 +899,7 @@ class PinyinTrainerApp:
 
         self.stats_button = ThemedButton(
             self.footer,
-            text="错误统计",
+            text=tr(self.lang, "stats_button"),
             command=self._open_stats,
             kind="soft",
             font=self.button_font,
@@ -948,6 +1012,7 @@ class PinyinTrainerApp:
         self.open_button.set_theme(theme)
         self.stats_button.set_theme(theme)
         self.theme_toggle.apply_theme(theme, self.theme_key)
+        self.language_toggle.apply_theme(theme)
 
         self._set_status(self._status_text, self._status_kind)
         self._apply_input_visuals()
@@ -961,6 +1026,50 @@ class PinyinTrainerApp:
         self._apply_theme()
         self._save_settings()
         self._restore_focus()
+
+    def _set_language(self, lang: str) -> None:
+        if lang not in LANGUAGES or lang == self.lang:
+            return
+        self.lang = lang
+        self._save_settings()
+        self._retranslate_ui()
+        self._set_status(tr(lang, "status_language_switched"), "info")
+        self._restore_focus()
+
+    def _retranslate_ui(self) -> None:
+        lang = self.lang
+        self.root.title(tr(lang, "app_title"))
+        self.title_label.configure(text=tr(lang, "app_title"))
+        if self.library is not None:
+            self._update_subtitle()
+        else:
+            self.subtitle_label.configure(text=tr(lang, "subtitle_loading"))
+        self.next_button.configure(text=tr(lang, "next_sentence"))
+        self.font_caption.configure(text=tr(lang, "font_size"))
+        self.group_caption.configure(text=tr(lang, "practice_group"))
+        self.hint_check.configure(text=tr(lang, "show_hints"))
+        self.input_title.configure(text=tr(lang, "input_title"))
+        self.input_hint.configure(text=tr(lang, "input_hint"))
+        self.footer_hint.configure(text=tr(lang, "footer_hint"))
+        self.open_button.configure(text=tr(lang, "open_bank"))
+        self.reload_button.configure(text=tr(lang, "reload_bank"))
+        self.stats_button.configure(text=tr(lang, "stats_button"))
+        for caption, key in zip(
+            self.stat_captions,
+            ("stat_time", "stat_progress", "stat_speed", "stat_today"),
+        ):
+            caption.configure(text=tr(lang, key))
+        self.theme_toggle.apply_language(lang)
+        self.language_toggle.apply_language(lang)
+        self._rebuild_group_menu()
+        self.today_input_var.set(
+            tr(
+                lang,
+                "value_chars",
+                count=self.daily_store.today_total(),
+            )
+        )
+        self._update_stats()
 
     # ------------------------------------------------------------------
     # Font size
@@ -1008,8 +1117,14 @@ class PinyinTrainerApp:
             if initial:
                 self._show_library_error(str(exc))
             else:
-                messagebox.showerror("题库加载失败", str(exc), parent=self.root)
-                self._set_status("题库加载失败，仍保持当前题库。", "error")
+                messagebox.showerror(
+                    tr(self.lang, "dialog_bank_load_failed_title"),
+                    str(exc),
+                    parent=self.root,
+                )
+                self._set_status(
+                    tr(self.lang, "status_bank_load_failed_keep"), "error"
+                )
             return False
 
         self.library = library
@@ -1024,14 +1139,28 @@ class PinyinTrainerApp:
         if library.skipped:
             detail = "\n".join(library.skipped[:8])
             if len(library.skipped) > 8:
-                detail += f"\n……另有 {len(library.skipped) - 8} 行"
+                detail += "\n" + tr(
+                    self.lang,
+                    "lines_skipped_more",
+                    count=len(library.skipped) - 8,
+                )
             messagebox.showwarning(
-                "部分句子被跳过",
-                f"已加载 {library.count} 句，以下内容未载入：\n\n{detail}",
+                tr(self.lang, "dialog_skipped_title"),
+                tr(
+                    self.lang,
+                    "dialog_skipped_body",
+                    count=library.count,
+                    detail=detail,
+                ),
                 parent=self.root,
             )
             self._set_status(
-                f"已加载 {library.count} 句，跳过 {len(library.skipped)} 行。",
+                tr(
+                    self.lang,
+                    "status_loaded_skipped",
+                    count=library.count,
+                    skipped=len(library.skipped),
+                ),
                 "info",
             )
         return True
@@ -1053,18 +1182,28 @@ class PinyinTrainerApp:
         count = len(self._filtered_sentences())
         if self.group_name == ALL_GROUPS:
             self.subtitle_label.configure(
-                text=f"题库 {self.library.count} 句 · 全部句子"
+                text=tr(
+                    self.lang,
+                    "subtitle_all",
+                    total=self.library.count,
+                )
             )
         else:
             self.subtitle_label.configure(
-                text=f"题库 {self.library.count} 句 · {self.group_name} {count} 句"
+                text=tr(
+                    self.lang,
+                    "subtitle_group",
+                    total=self.library.count,
+                    group=group_label(self.lang, self.group_name),
+                    count=count,
+                )
             )
 
     def _start_group(self) -> None:
         sentences = self._filtered_sentences()
         if not sentences:
             self.bag = None
-            self._set_status("当前分组没有可用句子。", "error")
+            self._set_status(tr(self.lang, "status_group_empty"), "error")
             return
         self.bag = SentenceBag(sentences)
         self._update_subtitle()
@@ -1075,14 +1214,25 @@ class PinyinTrainerApp:
             return
         if selected == self.group_name and self.sentence is not None:
             self.group_var.set(selected)
-            self.group_button_var.set(f"{selected}  ▾")
+            self.group_button_var.set(
+                f"{group_label(self.lang, selected)}  ▾"
+            )
             return
         self.group_name = selected
         self.group_var.set(selected)
-        self.group_button_var.set(f"{selected}  ▾")
+        self.group_button_var.set(
+            f"{group_label(self.lang, selected)}  ▾"
+        )
         self._save_settings()
         self._start_group()
-        self._set_status(f"已切换到：{selected}", "info")
+        self._set_status(
+            tr(
+                self.lang,
+                "status_switched",
+                group=group_label(self.lang, selected),
+            ),
+            "info",
+        )
         self._restore_focus()
 
     def _on_hint_toggle(self) -> None:
@@ -1093,27 +1243,32 @@ class PinyinTrainerApp:
         self._save_settings()
         self._schedule_layout(force=True)
         if self.show_pinyin:
-            self._set_status("已显示拼音提示；错字统计暂停记录。", "info")
+            self._set_status(tr(self.lang, "status_hints_on"), "info")
         else:
-            self._set_status("已关闭拼音提示；之后的错字会记录到统计。", "info")
+            self._set_status(tr(self.lang, "status_hints_off"), "info")
         self._restore_focus()
 
     def _show_library_error(self, message: str) -> None:
-        self.subtitle_label.configure(text="题库加载失败")
-        self._set_status("无法加载 sentences.txt，请检查文件。", "error")
+        self.subtitle_label.configure(text=tr(self.lang, "subtitle_failed"))
+        self._set_status(tr(self.lang, "status_bank_load_failed"), "error")
         if hasattr(self, "input_entry"):
             self.input_entry.configure(state="disabled")
         if hasattr(self, "group_menu"):
             self.group_menu.configure(state="disabled")
         messagebox.showerror(
-            "无法加载题库",
-            f"{message}\n\n请确认 sentences.txt 位于：\n{SENTENCES_FILE}",
+            tr(self.lang, "dialog_cannot_load_bank_title"),
+            tr(
+                self.lang,
+                "dialog_bank_path",
+                message=message,
+                path=SENTENCES_FILE,
+            ),
             parent=self.root,
         )
 
     def _reload_library(self) -> None:
         if self._load_library(initial=False):
-            self._set_status("题库已重新加载。", "info")
+            self._set_status(tr(self.lang, "status_bank_reloaded"), "info")
             self._restore_focus()
 
     def _on_reload_shortcut(self, _event=None):
@@ -1124,9 +1279,13 @@ class PinyinTrainerApp:
         try:
             os.startfile(str(SENTENCES_FILE))  # type: ignore[attr-defined]
         except OSError as exc:
-            messagebox.showerror("无法打开题库", str(exc), parent=self.root)
+            messagebox.showerror(
+                tr(self.lang, "dialog_cannot_open_bank_title"),
+                str(exc),
+                parent=self.root,
+            )
             return
-        self._set_status("已打开题库；保存后点击“重新加载题库”。", "info")
+        self._set_status(tr(self.lang, "status_bank_opened"), "info")
 
     def _open_stats(self) -> None:
         if self._stats_window is not None:
@@ -1150,7 +1309,7 @@ class PinyinTrainerApp:
             self.sentence = self.bag.next()
         except ValueError:
             return
-        self._prepare_attempt("输入第一个字母后开始计时。")
+        self._prepare_attempt(tr(self.lang, "status_start"))
 
     def _prepare_attempt(self, status: str) -> None:
         self._cancel_tick()
@@ -1172,7 +1331,7 @@ class PinyinTrainerApp:
     def _restart_current(self) -> None:
         if self.sentence is None:
             return
-        self._prepare_attempt("已重新开始本句。")
+        self._prepare_attempt(tr(self.lang, "status_restarted"))
 
     def _on_restart(self, _event=None):
         self._restart_current()
@@ -1182,7 +1341,9 @@ class PinyinTrainerApp:
         if self.analysis is not None and self.analysis.is_complete:
             self._next_sentence()
         elif self.sentence is not None:
-            self._set_status("整句输入完成后，按 Enter 进入下一句。", "muted")
+            self._set_status(
+                tr(self.lang, "status_enter_after_complete"), "muted"
+            )
         return "break"
 
     def _restore_focus(self) -> None:
@@ -1264,20 +1425,24 @@ class PinyinTrainerApp:
                 self.input_entry.configure(state="disabled")
                 elapsed = self._elapsed()
                 self._set_status(
-                    f"完成！用时 {elapsed:.1f} 秒，按 Enter 进入下一句。",
+                    tr(
+                        self.lang,
+                        "status_complete",
+                        seconds=elapsed,
+                    ),
                     "done",
                 )
             self._restore_focus()
             return
 
         if result.has_error:
-            self._set_status("拼音不匹配，按 Backspace 修改。", "error")
+            self._set_status(tr(self.lang, "status_mismatch"), "error")
         elif result.normalized:
-            self._set_status("输入正确，当前字会自动前进。", "muted")
+            self._set_status(tr(self.lang, "status_correct"), "muted")
         elif self.started_at is not None:
-            self._set_status("计时中，继续输入即可。", "muted")
+            self._set_status(tr(self.lang, "status_timing"), "muted")
         else:
-            self._set_status("输入第一个字母后开始计时。", "muted")
+            self._set_status(tr(self.lang, "status_start"), "muted")
 
     def _apply_input_visuals(self) -> None:
         if not hasattr(self, "input_display"):
@@ -1310,7 +1475,11 @@ class PinyinTrainerApp:
         if newly_completed:
             self.daily_store.add(newly_completed)
             self.today_input_var.set(
-                f"{self.daily_store.today_total()} 字"
+                tr(
+                    self.lang,
+                    "value_chars",
+                    count=self.daily_store.today_total(),
+                )
             )
 
     def _render_input_display(self) -> None:
@@ -1406,12 +1575,25 @@ class PinyinTrainerApp:
 
         completed = self.analysis.completed_chars if self.analysis else 0
         total = self.sentence.han_count if self.sentence else 0
-        self.progress_var.set(f"{completed} / {total} 字")
+        self.progress_var.set(
+            tr(
+                self.lang,
+                "progress_value",
+                done=completed,
+                total=total,
+            )
+        )
 
         if self.started_at is None or elapsed < 0.05:
-            self.speed_var.set("— 字/分")
+            self.speed_var.set(tr(self.lang, "value_cpm_empty"))
         else:
-            self.speed_var.set(f"{speed_cpm(completed, elapsed):.1f} 字/分")
+            self.speed_var.set(
+                tr(
+                    self.lang,
+                    "value_cpm",
+                    speed=f"{speed_cpm(completed, elapsed):.1f}",
+                )
+            )
 
     # ------------------------------------------------------------------
     # Sentence rendering
@@ -1492,7 +1674,7 @@ class PinyinTrainerApp:
         if self.sentence is None:
             label = tk.Label(
                 self.sentence_content,
-                text="题库中没有可练习的句子",
+                text=tr(self.lang, "status_no_sentences"),
                 font=self.ui_font,
                 bg=self.theme.surface,
                 fg=self.theme.muted,
@@ -1656,10 +1838,11 @@ class StatsWindow(tk.Toplevel):
     def __init__(self, app: PinyinTrainerApp) -> None:
         super().__init__(app.root)
         self.app = app
+        self.lang = app.lang
         self.theme = app.theme
         self.period = "today"
         self._table_scroll_visible = False
-        self.title("错字统计")
+        self.title(tr(self.lang, "stats_title"))
         self.configure(bg=self.theme.bg)
         self.transient(app.root)
         self.minsize(920, 600)
@@ -1716,7 +1899,7 @@ class StatsWindow(tk.Toplevel):
         header.pack(fill="x")
         title = tk.Label(
             header,
-            text="错字统计",
+            text=tr(self.lang, "stats_title"),
             font=self.heading_font,
             bg=theme.bg,
             fg=theme.text,
@@ -1724,7 +1907,7 @@ class StatsWindow(tk.Toplevel):
         title.pack(side="left")
         close_button = ThemedButton(
             header,
-            text="关闭",
+            text=tr(self.lang, "stats_close"),
             command=self.close,
             kind="soft",
             font=self.button_font,
@@ -1736,7 +1919,7 @@ class StatsWindow(tk.Toplevel):
 
         subtitle = tk.Label(
             container,
-            text="只统计未显示拼音提示时的打错汉字 · 本周从周一开始",
+            text=tr(self.lang, "stats_subtitle"),
             font=self.small_font,
             bg=theme.bg,
             fg=theme.muted,
@@ -1747,7 +1930,7 @@ class StatsWindow(tk.Toplevel):
         toolbar.pack(fill="x", pady=(12, 0))
         caption = tk.Label(
             toolbar,
-            text="查看范围",
+            text=tr(self.lang, "stats_view"),
             font=self.small_font,
             bg=theme.bg,
             fg=theme.muted,
@@ -1758,7 +1941,7 @@ class StatsWindow(tk.Toplevel):
         for period in PERIODS:
             button = ThemedButton(
                 toolbar,
-                text=PERIOD_LABELS[period],
+                text=self._period_label(period),
                 command=lambda selected=period: self._select_period(selected),
                 kind="segment",
                 font=self.button_font,
@@ -1790,10 +1973,10 @@ class StatsWindow(tk.Toplevel):
         header.pack(fill="x")
         header.grid_columnconfigure(2, weight=1)
         for column, text, width in (
-            (0, "拼音", 12),
-            (1, "错误次数", 8),
-            (2, "汉字（按次数排序）", 0),
-            (3, "最后出错", 14),
+            (0, tr(self.lang, "stats_header_pinyin"), 12),
+            (1, tr(self.lang, "stats_header_count"), 8),
+            (2, tr(self.lang, "stats_header_chars"), 0),
+            (3, tr(self.lang, "stats_header_last"), 14),
         ):
             label = tk.Label(
                 header,
@@ -1843,7 +2026,7 @@ class StatsWindow(tk.Toplevel):
         footer.pack(fill="x", pady=(12, 0))
         note = tk.Label(
             footer,
-            text="只统计关闭拼音提示时的错误 · 全部显示 · 本周从周一开始",
+            text=tr(self.lang, "stats_footer"),
             font=self.small_font,
             bg=theme.bg,
             fg=theme.muted,
@@ -1851,7 +2034,7 @@ class StatsWindow(tk.Toplevel):
         note.pack(side="left")
         clear_button = ThemedButton(
             footer,
-            text="清空统计",
+            text=tr(self.lang, "stats_clear"),
             command=self._clear,
             kind="soft",
             font=self.button_font,
@@ -1879,7 +2062,13 @@ class StatsWindow(tk.Toplevel):
 
         range_text = self._period_range(self.period, now)
         self.summary_label.configure(
-            text=f"{range_text} · 共 {summary.total} 次错误 · {len(summary.items)} 个拼音"
+            text=tr(
+                self.lang,
+                "stats_summary",
+                range=range_text,
+                total=summary.total,
+                groups=len(summary.items),
+            )
         )
 
         for child in self.table_body.winfo_children():
@@ -1889,7 +2078,7 @@ class StatsWindow(tk.Toplevel):
         if not summary.items:
             empty = tk.Label(
                 self.table_body,
-                text="当前时间范围内没有打错记录",
+                text=tr(self.lang, "stats_empty"),
                 font=self.body_font,
                 bg=theme.surface,
                 fg=theme.faint,
@@ -2019,32 +2208,57 @@ class StatsWindow(tk.Toplevel):
         self.table_canvas.yview_scroll(step, "units")
         return "break"
 
-    @staticmethod
-    def _period_range(period: str, now: datetime) -> str:
+    def _period_label(self, period: str) -> str:
+        key = {
+            "today": "stats_today",
+            "week": "stats_week",
+            "month": "stats_month",
+        }.get(period, "stats_today")
+        return tr(self.lang, key)
+
+    def _period_range(self, period: str, now: datetime) -> str:
         if period == "today":
             return now.strftime("%Y-%m-%d")
         if period == "week":
             start = now - timedelta(days=now.weekday())
-            return f"{start:%m-%d} 至 {now:%m-%d}"
-        return now.strftime("%Y 年 %m 月")
+            return tr(
+                self.lang,
+                "period_range_week",
+                start=start.strftime("%m-%d"),
+                end=now.strftime("%m-%d"),
+            )
+        return tr(
+            self.lang,
+            "period_range_month",
+            year=now.strftime("%Y"),
+            month=now.strftime("%m"),
+        )
 
-    @staticmethod
-    def _last_time(at: datetime, now: datetime) -> str:
+    def _last_time(self, at: datetime, now: datetime) -> str:
         local = at.astimezone(now.tzinfo)
         if local.date() == now.date():
-            return local.strftime("最后 %H:%M")
-        return local.strftime("最后 %m-%d %H:%M")
+            return tr(
+                self.lang,
+                "last_time_today",
+                time=local.strftime("%H:%M"),
+            )
+        return tr(
+            self.lang,
+            "last_time_other",
+            date=local.strftime("%m-%d"),
+            time=local.strftime("%H:%M"),
+        )
 
     def _clear(self) -> None:
         if not messagebox.askyesno(
-            "清空统计",
-            "确定清空所有错字记录吗？此操作不可撤销。",
+            tr(self.lang, "dialog_clear_title"),
+            tr(self.lang, "dialog_clear_body"),
             parent=self,
         ):
             return
         self.app.stats_store.clear()
         self._refresh_table()
-        self.app._set_status("错字统计已清空。", "info")
+        self.app._set_status(tr(self.lang, "stats_cleared"), "info")
 
     def close(self) -> None:
         try:
